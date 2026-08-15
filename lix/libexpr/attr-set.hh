@@ -73,6 +73,17 @@ public:
 
     const Attr * get(Symbol name)
     {
+        /* Most attrsets are tiny (let bindings, function arguments,
+           config objects with a handful of keys). For small sizes a
+           linear scan beats std::lower_bound: binary search's branch
+           mispredictions dominate for tiny N, and the comparisons are
+           cheap 32-bit symbol id equality tests. See the Attr
+           static_assert above for how size-sensitive this path is. */
+        if (size_ <= 16) {
+            for (iterator i = begin(); i != end(); ++i)
+                if (i->name == name) return &*i;
+            return nullptr;
+        }
         iterator i = std::lower_bound(begin(), end(), name, [](const Attr & value, const Symbol & compare) {
             return value.name < compare;
         });
