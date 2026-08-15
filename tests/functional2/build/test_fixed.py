@@ -1,4 +1,6 @@
+import os
 import re
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -50,6 +52,55 @@ def test_good(nix: Nix):
 def test_check(nix: Nix):
     res = nix.nix_build(["fixed.nix", "-A", "check", "--check"]).run().expect(1)
     assert "has no valid outputs registered in the store" in res.stderr_plain
+
+
+@with_files(get_global_asset_pack("fixed"))
+def test_check_deterministic(nix: Nix):
+    # A fixed-output derivation whose rebuild matches the declared hash
+    # must pass `--check` (the freshly built output is compared against
+    # the previously registered one at the declared-hash path).
+    nix.nix_build(["fixed.nix", "-A", "good.0", "--no-out-link"]).run().ok()
+    nix.nix_build(["fixed.nix", "-A", "good.0", "--no-out-link", "--check"]).run().ok()
+
+
+@with_files(get_global_asset_pack("fixed"))
+@pytest.mark.nix_settings(trusted_users="*")
+def test_check_fod_diff_hook(nix: Nix):
+    # `check` declares the same hash as `good.2`, but its builder produces
+    # different content.  A `--check` rebuild therefore yields a different
+    # content hash, and the diff hook must be run against the previously
+    # registered output at the declared-hash path.
+    nix.nix_build(["fixed.nix", "-A", "good.2", "--no-out-link"]).run().ok()
+
+    # The diff hook is executed by the run-diff-hook helper on behalf of the
+    # build user, which may differ from the user running the test.  The pytest
+    # temp dirs are not traversable by other users, so put the script in the
+    # world-traversable OS temp dir, and give it a PATH-independent shebang:
+    # the test environment's PATH may not contain the script interpreter.
+    diff_hook = Path(tempfile.gettempdir()) / f"lix-test-diff-hook-{os.getpid()}.sh"
+    diff_hook.write_text("#!/bin/sh\necho diff-hook ran\n")
+    diff_hook.chmod(0o755)
+    try:
+        res = (
+            nix.nix_build(
+                [
+                    "fixed.nix",
+                    "-A",
+                    "check",
+                    "--no-out-link",
+                    "--check",
+                    "--diff-hook",
+                    str(diff_hook),
+                    "--run-diff-hook",
+                ]
+            )
+            .run()
+            .expect(102 if nix.daemon_protocol is None else 1)
+        )
+    finally:
+        diff_hook.unlink(missing_ok=True)
+    assert "hash mismatch in fixed-output derivation" in res.stderr_plain
+    assert "diff-hook ran" in res.stderr_plain
 
 
 @with_files(get_global_asset_pack("fixed"))

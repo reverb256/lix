@@ -1802,45 +1802,71 @@ try {
             }
         }
 
-        // Check determinism and run the diff hook for input-addressed
-        // paths if we're in check mode.
-        // TODO: implement this for content-addressed paths too.
-        if (buildMode == bmCheck && !newInfo.ca) {
+        // Check determinism and run the diff hook in check mode.  This
+        // applies to input-addressed paths and to fixed-output
+        // derivations alike: for the latter, a rebuild that matches the
+        // declared hash lands at the same (previously registered) path
+        // and can be compared directly.  (Floating content-addressed
+        // derivations are rejected by Lix, so a content-addressed output
+        // here always means a fixed-output derivation.)
+        if (buildMode == bmCheck) {
 
             // We can only do this if we have a previous output path to compare.
-            if (!TRY_AWAIT(worker.store.isValidPath(newInfo.path))) continue;
-            ValidPathInfo oldInfo(*TRY_AWAIT(worker.store.queryPathInfo(newInfo.path)));
-            if (newInfo.narHash != oldInfo.narHash) {
-                anyCheckMismatchSeen = true;
-                if (settings.runDiffHook || settings.keepFailed) {
-                    auto dst = worker.store.toRealPath(finalDestPath + checkSuffix);
-                    deletePath(dst);
-                    movePath(actualPath, dst);
+            if (TRY_AWAIT(worker.store.isValidPath(newInfo.path))) {
+                ValidPathInfo oldInfo(*TRY_AWAIT(worker.store.queryPathInfo(newInfo.path)));
+                if (newInfo.narHash != oldInfo.narHash) {
+                    anyCheckMismatchSeen = true;
+                    if (settings.runDiffHook || settings.keepFailed) {
+                        auto dst = worker.store.toRealPath(finalDestPath + checkSuffix);
+                        deletePath(dst);
+                        movePath(actualPath, dst);
 
+                        TRY_AWAIT(handleDiffHook(
+                            buildUser ? std::optional(buildUser->getUID()) : std::nullopt,
+                            buildUser ? std::optional(buildUser->getGID()) : std::nullopt,
+                            finalDestPath,
+                            dst,
+                            worker.store.printStorePath(drvPath),
+                            tmpDir
+                        ));
+
+                        nondeterministic.push_back(std::make_pair(worker.store.toRealPath(finalDestPath), dst));
+                    } else
+                        nondeterministic.push_back(std::make_pair(worker.store.toRealPath(finalDestPath), std::nullopt));
+                }
+
+                /* Since we verified the build, it's now ultimately trusted. */
+                else if (!oldInfo.ultimate) {
+                    oldInfo.ultimate = true;
+                    localStore.signPathInfo(oldInfo);
+                    TRY_AWAIT(localStore.registerValidPaths({{oldInfo.path, oldInfo}}));
+                }
+
+                /* Don't register anything, since we already have the
+                   previous versions which we're comparing. */
+                continue;
+            }
+
+            /* A fixed-output derivation whose rebuild produced different
+               content lands at a fresh path derived from the new hash, so
+               there is no previously registered output there to compare
+               against.  Instead, run the diff hook against the previously
+               registered output at the declared-hash path; the hash
+               mismatch itself is reported below.  We fall through so the
+               fresh output gets registered and the "got path" in that
+               report stays valid. */
+            if (newInfo.ca && settings.runDiffHook) {
+                if (TRY_AWAIT(worker.store.isValidPath(fixedPath))) {
                     TRY_AWAIT(handleDiffHook(
                         buildUser ? std::optional(buildUser->getUID()) : std::nullopt,
                         buildUser ? std::optional(buildUser->getGID()) : std::nullopt,
-                        finalDestPath,
-                        dst,
+                        worker.store.printStorePath(fixedPath),
+                        actualPath,
                         worker.store.printStorePath(drvPath),
                         tmpDir
                     ));
-
-                    nondeterministic.push_back(std::make_pair(worker.store.toRealPath(finalDestPath), dst));
-                } else
-                    nondeterministic.push_back(std::make_pair(worker.store.toRealPath(finalDestPath), std::nullopt));
+                }
             }
-
-            /* Since we verified the build, it's now ultimately trusted. */
-            else if (!oldInfo.ultimate) {
-                oldInfo.ultimate = true;
-                localStore.signPathInfo(oldInfo);
-                TRY_AWAIT(localStore.registerValidPaths({{oldInfo.path, oldInfo}}));
-            }
-
-            /* Don't register anything, since we already have the
-               previous versions which we're comparing. */
-            continue;
         }
 
         /* For debugging, print out the referenced and unreferenced paths. */

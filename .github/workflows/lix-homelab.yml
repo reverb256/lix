@@ -59,12 +59,17 @@ jobs:
         # tolerate EXACTLY that signature (same test + same unshare EPERM)
         # and fail on anything else. A self-hosted runner on nexus would run
         # the full suite for real.
+        # GitHub Actions runs scripts with `bash -e` by default, so the
+        # failing pipeline below would abort the script before the tolerate
+        # logic runs — disable errexit around it and restore it after.
         run: |
           set -o pipefail
           NIX_BIN="$(command -v nix)"
           LOG=/tmp/lix-build.log
+          set +e
           sudo -E env "PATH=$PATH" "$NIX_BIN" build .#nix --print-out-paths --option sandbox false 2>&1 | tee "$LOG"
           rc=${PIPESTATUS[0]}
+          set -e
           if [[ $rc -ne 0 ]] \
             && grep -q "unshare: cannot change root filesystem propagation: Permission denied" "$LOG" \
             && grep -q "test_import_from_derivation" "$LOG"; then
