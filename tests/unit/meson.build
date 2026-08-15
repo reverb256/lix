@@ -27,7 +27,6 @@ libutil_test_support_sources = files(
 libutil_test_support = library(
   'lixutil-test-support',
   libutil_test_support_sources,
-  liblix_generated_headers,
   dependencies : [
     liblix,
     rapidcheck,
@@ -84,7 +83,6 @@ libutil_tests_sources = files(
 libutil_tester = executable(
   'liblixutil-tests',
   libutil_tests_sources,
-  liblix_generated_headers,
   dependencies : [
     libasanoptions,
     rapidcheck,
@@ -118,7 +116,6 @@ libstore_test_support_sources = files(
 libstore_test_support = library(
   'lixstore-test-support',
   libstore_test_support_sources,
-  liblix_generated_headers,
   dependencies : [
     liblixutil_test_support,
     liblix,
@@ -152,7 +149,6 @@ libstore_tests_sources = files(
 libstore_tester = executable(
   'liblixstore-tests',
   libstore_tests_sources,
-  liblix_generated_headers,
   dependencies : [
     libasanoptions,
     liblixstore_test_support,
@@ -185,7 +181,6 @@ libexpr_test_support_sources = files(
 libexpr_test_support = library(
   'lixexpr-test-support',
   libexpr_test_support_sources,
-  liblix_generated_headers,
   dependencies : [
     liblixstore_test_support,
     liblix,
@@ -218,7 +213,6 @@ libexpr_tests_sources = files(
 libexpr_tester = executable(
   'liblixexpr-tests',
   libexpr_tests_sources,
-  liblix_generated_headers,
   dependencies : [
     libasanoptions,
     liblixexpr_test_support,
@@ -247,7 +241,6 @@ test(
 libcmd_tester = executable(
   'liblix-tests',
   files('libcmd/args.cc'),
-  liblix_generated_headers,
   dependencies : [
     libasanoptions,
     liblix,
@@ -283,7 +276,6 @@ libmain_tests_sources = files(
 libmain_tester = executable(
   'liblixmain-tests',
   libmain_tests_sources,
-  liblix_generated_headers,
   dependencies : [
     liblix,
     gtest,

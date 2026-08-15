@@ -285,6 +285,14 @@ else
     include_directories : include_directories('..'),
     dependencies : dependencies,
     link_with : [ liblix_all_shared ],
+    # The nix executable (and anything else consuming liblix) compiles
+    # against the generated zngur bridge / embedded-sandbox-shell headers,
+    # but a plain include_directories dependency creates no ninja ordering
+    # edge to the codegen target: with high parallelism the CLI sources
+    # compile before lix/lix-rs/zngur.gen.hh exists and fail with
+    # "fatal error: 'lix/lix-rs/zngur.gen.hh' file not found". Propagate the
+    # generated headers as sources so dependents wait for the codegen.
+    sources : liblix_generated_headers,
   )
 endif
 
