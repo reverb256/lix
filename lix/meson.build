@@ -208,7 +208,7 @@ liblix_cpp_static = static_library(
   cpp_pch : cpp_pch,
 )
 
-if meson.can_run_host_binaries()
+if meson.can_run_host_binaries() and enable_tests
   lixrs_test_deps = []
   foreach dep : dependencies.flatten()
     lixrs_test_deps += dep.name()
