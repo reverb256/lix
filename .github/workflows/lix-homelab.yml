@@ -1,0 +1,48 @@
+name: lix-homelab
+
+# Builds the homelab-patched Lix (with its test suite) on pushes to
+# homelab/* branches and pushes the outputs to the reverb-os cachix.
+# This is the only place the patched tree gets tested — the cluster
+# build itself disables Lix's test suite (sandbox-incompatible).
+#
+# Note: `nix build .#nix` runs doCheck by default (lix's own
+# package.nix: doCheck = canRunInstalled), so a green run means the
+# patched tree builds AND its functional/cargo tests pass.
+
+on:
+  push:
+    branches: ["homelab/*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + test + push to cachix
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable reverb-os cachix
+        uses: cachix/cachix-action@v14
+        with:
+          name: reverb-os
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+
+      - name: Build Lix (with tests)
+        run: nix build .#nix --print-out-paths
+
+      - name: Push outputs to reverb-os cachix
+        run: |
+          set -euo pipefail
+          nix path-info .#nix | xargs -r cachix push reverb-os
