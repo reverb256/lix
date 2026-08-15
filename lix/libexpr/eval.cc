@@ -204,7 +204,7 @@ void initLibExpr()
     GC_set_oom_fn(oomHandler);
 
     /* Set the initial heap size to something fairly big (25% of
-       physical RAM, up to a maximum of 384 MiB) so that in most cases
+       physical RAM, up to a maximum of 8 GiB) so that in most cases
        we don't need to garbage collect at all.  (Collection has a
        fairly significant overhead.)  The heap size can be overridden
        through libgc's GC_INITIAL_HEAP_SIZE environment variable.  We
@@ -215,7 +215,7 @@ void initLibExpr()
     if (!getEnv("GC_INITIAL_HEAP_SIZE")) {
         int64_t size = 32l * 1024 * 1024;
 #if HAVE_SYSCONF && defined(_SC_PAGESIZE) && defined(_SC_PHYS_PAGES)
-        int64_t maxSize = 384l * 1024 * 1024;
+        int64_t maxSize = 8l * 1024 * 1024 * 1024;
         int64_t pageSize = sysconf(_SC_PAGESIZE);
         int64_t pages = sysconf(_SC_PHYS_PAGES);
         if (pageSize != -1) {
