@@ -40,7 +40,16 @@ jobs:
           skipPush: true
 
       - name: Build Lix (with tests)
-        run: nix build .#nix --print-out-paths
+        # Run as root: the functional2 suite's IFD test builds a derivation
+        # through the daemon and needs to unshare(2) mount namespaces, which
+        # the unprivileged GitHub runner user cannot do ("cannot change root
+        # filesystem propagation: Permission denied"). Root on the runner VM
+        # can. Everything else in the suite passes as the regular user.
+        # Pass PATH explicitly: sudo resets PATH to secure_path, and nix
+        # lives in the runner user's profile.
+        run: |
+          NIX_BIN="$(command -v nix)"
+          sudo -E env "PATH=$PATH" "$NIX_BIN" build .#nix --print-out-paths
 
       - name: Push outputs to reverb-os cachix
         run: |
