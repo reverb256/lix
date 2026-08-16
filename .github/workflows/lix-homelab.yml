@@ -47,7 +47,11 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          nix build .#nix --print-out-paths
+          # Build on this runner only: nexus's daemon would otherwise
+          # dispatch to its remote builders (zephyr/sentry via
+          # /etc/nix/machines), which defeats the point of the
+          # self-hosted runner and makes CI die with the remote builder.
+          nix build .#nix --print-out-paths --builders ""
 
       - name: Push outputs to reverb-os cachix
         if: steps.build.outcome == 'success'
