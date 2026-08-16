@@ -8,6 +8,12 @@ name: lix-homelab
 # Note: `nix build .#nix` runs doCheck by default (lix's own
 # package.nix: doCheck = canRunInstalled), so a green run means the
 # patched tree builds AND its functional/cargo tests pass.
+#
+# Runs on the self-hosted nexus runner (reverb256/nixos-config
+# ci-runners generator, `lix` instance) — the only place the
+# functional2 suite can run for real: the suite spawns its own daemon
+# that does REAL sandboxing (unshare mount namespaces), which
+# GitHub-hosted runners block at the kernel level.
 
 on:
   push:
@@ -20,20 +26,13 @@ permissions:
 jobs:
   build:
     name: build + test + push to cachix
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos, nexus, builder]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@v30
-        with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-          extra_nix_config: |
-            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-
       - name: Enable reverb-os cachix
-        uses: cachix/cachix-action@v14
+        uses: cachix/cachix-action@v15
         with:
           name: reverb-os
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
@@ -41,52 +40,12 @@ jobs:
 
       - name: Build Lix (with tests)
         id: build
-        # Two things are needed for the test suite to run on GitHub runners:
-        #
-        # 1. Run as root (sudo resets PATH to secure_path, and nix lives in
-        #    the runner user's profile, so pass the resolved binary and PATH
-        #    explicitly).
-        # 2. Build with --option sandbox false: the functional2 suite spawns
-        #    its own daemon which does REAL sandboxing (unshare mount
-        #    namespaces). Nested inside the outer `nix build` sandbox, that
-        #    fails with "cannot change root filesystem propagation: Permission
-        #    denied" on the runner.
-        #
-        # Known limitation: even unsandboxed and as root, GitHub-hosted
-        # runners block the mount-namespace propagation change the daemon's
-        # sandbox needs, so test_import_from_derivation fails there (55/65
-        # pass; the harness also skips full_sandbox tests when its own unshare
-        # probe fails). The failure is kernel-level, not a code issue — we
-        # tolerate EXACTLY that signature (same test + same unshare EPERM)
-        # and fail on anything else. A self-hosted runner on nexus would run
-        # the full suite for real.
-        # GitHub Actions runs scripts with `bash -e` by default, so the
-        # failing pipeline below would abort the script before the tolerate
-        # logic runs — disable errexit around it and restore it after.
-        # Note: when the build is tolerated it FAILED (nix build exits nonzero
-        # because the derivation's test phase reported a failure), so its
-        # output path is never created — record that so the push step below
-        # skips instead of failing on `path ... is not valid`.
         run: |
-          set -o pipefail
-          NIX_BIN="$(command -v nix)"
-          LOG=/tmp/lix-build.log
-          set +e
-          sudo -E env "PATH=$PATH" "$NIX_BIN" build .#nix --print-out-paths --option sandbox false 2>&1 | tee "$LOG"
-          rc=${PIPESTATUS[0]}
-          set -e
-          if [[ $rc -ne 0 ]] \
-            && grep -q "unshare: cannot change root filesystem propagation: Permission denied" "$LOG" \
-            && grep -q "test_import_from_derivation" "$LOG"; then
-            echo "::warning::test_import_from_derivation fails on GitHub-hosted runners (kernel blocks mount-namespace propagation). All other tests passed; continuing."
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "built=true" >> "$GITHUB_OUTPUT"
-          exit $rc
+          set -euo pipefail
+          nix build .#nix --print-out-paths
 
       - name: Push outputs to reverb-os cachix
-        if: steps.build.outputs.built == 'true'
+        if: steps.build.outcome == 'success'
         run: |
           set -euo pipefail
           nix path-info .#nix | xargs -r cachix push reverb-os
