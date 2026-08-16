@@ -37,6 +37,11 @@ jobs:
           name: reverb-os
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
           skipPush: true
+          # The runner user is not a nix trusted user, so `cachix use`
+          # (which writes nix.conf) would fail — same pattern as the
+          # nixos-config workflows.
+          skipAddingSubstituter: true
+          useDaemon: false
 
       - name: Build Lix (with tests)
         id: build
