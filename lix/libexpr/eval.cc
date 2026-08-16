@@ -1829,7 +1829,16 @@ SingleDerivedPath EvalState::coerceToSingleDerivedPath(const PosIdx pos, Value &
     auto [derivedPath, s_] = coerceToSingleDerivedPathUnchecked(pos, v, errorCtx);
     auto s = s_;
     auto sExpected = mkSingleDerivedPathStringRaw(derivedPath);
-    if (s != sExpected) {
+    /* Homelab fork (2026-08-16): accept paths INSIDE the derived output,
+       not only exact output equality. The universal app idiom
+       `program = "${pkg}/bin/foo"` produces a string whose context names
+       the drv+output while the string points at a sub-path inside that
+       output. Strict equality made `nix build .#apps.*.program` unusable
+       for every flake using the canonical idiom ("string ... is not the
+       right placeholder for this derivation output"). A prefix check
+       preserves the corruption guard: a string that does not correspond
+       to its stated output at all still fails. */
+    if (s != sExpected && !s.starts_with(sExpected + "/")) {
         /* `std::visit` is used here just to provide a more precise
            error message. */
         std::visit(overloaded {
