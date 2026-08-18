@@ -370,7 +370,8 @@ struct GitInputScheme : InputScheme
             url.scheme != "git+http" &&
             url.scheme != "git+https" &&
             url.scheme != "git+ssh" &&
-            url.scheme != "git+file") return {};
+            url.scheme != "git+file" &&
+            url.scheme != "gitlawb") return {};
 
         auto url2(url);
         if (url2.scheme.starts_with("git+")) url2.scheme = std::string(url2.scheme, 4);
@@ -407,7 +408,7 @@ struct GitInputScheme : InputScheme
     ParsedURL toURL(const Input & input) const override
     {
         auto url = parseURL(getStrAttr(input.attrs, "url"));
-        if (url.scheme != "git") url.scheme = "git+" + url.scheme;
+        if (url.scheme != "git" && url.scheme != "gitlawb") url.scheme = "git+" + url.scheme;
         if (auto rev = input.getRev()) {
             url.query.insert_or_assign("rev", base16Encode(*rev));
         }
