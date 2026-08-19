@@ -1,18 +1,89 @@
+#include "lix/libexpr/eval-error.hh"
+#include "lix/libexpr/eval-inline.hh"
 #include "lix/libexpr/eval-settings.hh"
 #include "lix/libexpr/parallel-eval.hh"
 #include "lix/libutil/error.hh"
+#include "lix/libutil/logging.hh"
 
 #include <gtest/gtest.h>
+
+#include "tests/libexpr.hh"
 
 #include <atomic>
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
 
 namespace nix {
 
 class ExecutorTest : public testing::Test
 {};
+
+/**
+ * Logger that counts occurrences of a marker string, used to prove
+ * that a thunk is evaluated exactly once under concurrent forcing.
+ */
+struct CountingTraceLogger : Logger
+{
+    std::atomic<size_t> & count;
+
+    explicit CountingTraceLogger(std::atomic<size_t> & count) : count(count) {}
+
+    BufferState log(Verbosity, std::string_view s) override
+    {
+        if (s.find("EVALED") != std::string_view::npos) {
+            count.fetch_add(1);
+        }
+        return BufferState::HasSpace;
+    }
+
+    BufferState logEI(const ErrorInfo & ei) override
+    {
+        return BufferState::HasSpace;
+    }
+};
+
+/**
+ * Installs a counting logger for the duration of the scope.
+ */
+struct ScopedTraceCounter
+{
+    std::atomic<size_t> count{0};
+    Logger * old;
+    CountingTraceLogger counting;
+
+    ScopedTraceCounter() : old(logger), counting(count)
+    {
+        logger = &counting;
+    }
+
+    ~ScopedTraceCounter()
+    {
+        logger = old;
+    }
+};
+
+class ParallelEvalTest : public LibExprTest
+{
+protected:
+    /**
+     * Builds a fresh, slow thunk: `let go = n: if n == 0 then
+     * builtins.trace "EVALED" 42 else go (n - 1); in { a = go 9500; }`
+     * (kept under the default maxCallDepth of 10000). The trace fires
+     * exactly once per evaluation, so counting "EVALED" proves how
+     * many threads evaluated the thunk.
+     */
+    Value slowThunk()
+    {
+        auto v = eval(
+            "let go = n: if n == 0 then builtins.trace \"EVALED\" 42 else go (n - 1); "
+            "in { a = go 9500; }",
+            false
+        );
+        return v;
+    }
+};
 
 TEST_F(ExecutorTest, spawnRunsAllWorkItems)
 {
@@ -122,6 +193,105 @@ TEST_F(ExecutorTest, workerThreadsAreMarked)
     auto futures = executor.spawn(std::move(items));
     futures[0].get();
     ASSERT_TRUE(sawWorker.load());
+}
+
+TEST_F(ParallelEvalTest, concurrentForceOfSharedThunkEvaluatesOnce)
+{
+    ScopedTraceCounter counter;
+
+    // Several rounds of fresh thunks to stress the state machine.
+    for (int round = 0; round < 20; ++round) {
+        counter.count = 0;
+        auto v = slowThunk();
+        auto a = v.attrs()->get(createSymbol("a"));
+        ASSERT_THAT(a->value, IsThunk());
+
+        std::atomic<size_t> ok{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&] {
+                state.forceValue(a->value, noPos);
+                if (a->value.type() == nInt && a->value.integer().value == 42) {
+                    ok.fetch_add(1);
+                }
+            });
+        }
+        for (auto & t : threads) {
+            t.join();
+        }
+
+        ASSERT_EQ(ok.load(), 4);
+        // Exactly one thread evaluated the thunk; the rest waited for
+        // the winner.
+        ASSERT_EQ(counter.count.load(), 1);
+    }
+}
+
+TEST_F(ParallelEvalTest, concurrentForceOfResolvedThunk)
+{
+    auto v = slowThunk();
+    auto a = v.attrs()->get(createSymbol("a"));
+
+    // Resolve once on the main thread; it is now memoized.
+    state.forceValue(a->value, noPos);
+    ASSERT_EQ(a->value.integer().value, 42);
+
+    std::atomic<size_t> ok{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&] {
+            state.forceValue(a->value, noPos);
+            if (a->value.integer().value == 42) {
+                ok.fetch_add(1);
+            }
+        });
+    }
+    for (auto & t : threads) {
+        t.join();
+    }
+    ASSERT_EQ(ok.load(), 4);
+}
+
+TEST_F(ParallelEvalTest, executorWorkersForceSharedThunk)
+{
+    ScopedTraceCounter counter;
+
+    EvalSettings evalSettings;
+    evalSettings.set("eval-cores", "4");
+    Executor executor(evalSettings);
+
+    auto v = slowThunk();
+    auto a = v.attrs()->get(createSymbol("a"));
+    ASSERT_THAT(a->value, IsThunk());
+
+    std::atomic<size_t> ok{0};
+    Executor::WorkItems items;
+    for (int i = 0; i < 4; ++i) {
+        items.emplace_back(
+            [&] {
+                state.forceValue(a->value, noPos);
+                if (a->value.integer().value == 42) {
+                    ok.fetch_add(1);
+                }
+            },
+            0
+        );
+    }
+    auto futures = executor.spawn(std::move(items));
+    for (auto & future : futures) {
+        future.get();
+    }
+
+    ASSERT_EQ(ok.load(), 4);
+    ASSERT_EQ(counter.count.load(), 1);
+}
+
+TEST_F(ParallelEvalTest, sameThreadRecursionStillErrors)
+{
+    // Same-thread infinite recursion must still raise an error (it must
+    // not turn into a cross-thread wait that deadlocks).
+    ASSERT_THROW(eval("let x = x; in x"), InfiniteRecursionError);
+    ASSERT_THROW(eval("rec { a = b; b = a; }.a"), InfiniteRecursionError);
 }
 
 } // namespace nix

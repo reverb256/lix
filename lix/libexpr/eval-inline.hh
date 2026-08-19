@@ -5,6 +5,7 @@
 #include "lix/libexpr/eval.hh"
 #include "lix/libexpr/eval-error.hh"
 #include "lix/libexpr/gc-alloc.hh"
+#include "lix/libexpr/thunk-wait.hh"
 #include "value.hh"
 
 namespace nix {
@@ -40,7 +41,11 @@ inline Value::Value(
 inline Value::Value(thunk_t, EvalMemory & mem, Env & env, Expr & expr)
 {
     auto thunk = mem.allocType<Thunk>();
-    *thunk = {._env = &env, .expr = &expr};
+    // Member-wise init: Thunk contains a std::atomic, so it has no
+    // copy assignment operator. The state field is zero-initialised by
+    // the allocator (calloc), i.e. ThunkState::Unevaluated.
+    thunk->_env = &env;
+    thunk->expr = &expr;
     raw = tag(tThunk, thunk);
 }
 
@@ -189,6 +194,89 @@ Bindings * EvalState::checkAttrs(Value & v, Args &&... errorArgs)
     return v.attrs();
 }
 
+// The slow path of forceValue for thunks: claim / wait / evaluate /
+// publish according to the ThunkState machine in value.hh. Kept out
+// of line so forceValue's hot path (the resolved check) stays small.
+[[gnu::noinline]]
+static void forceThunk(EvalState & state, Value & v, Value::Thunk & thunk, const PosIdx pos)
+{
+    while (true) {
+        auto st = thunk.state.load(std::memory_order_acquire);
+
+        switch (st & ThunkStateMask) {
+
+        case static_cast<uint32_t>(ThunkState::Resolved): {
+            v = thunk.result();
+            return;
+        }
+
+        case static_cast<uint32_t>(ThunkState::Unevaluated): {
+            auto id = getMyEvalThreadId();
+            uint32_t expected = static_cast<uint32_t>(ThunkState::Unevaluated);
+            uint32_t claimed = static_cast<uint32_t>(ThunkState::Evaluating) | (id << ThunkIdShift);
+            if (!thunk.state.compare_exchange_strong(
+                    expected, claimed, std::memory_order_acquire, std::memory_order_acquire
+                ))
+            {
+                continue; // lost the race to another thread; re-read the state
+            }
+
+            // Claimed: we evaluate the thunk ourselves.
+            Env * env = thunk.env();
+            Expr * expr = thunk.expr;
+            // Mark as a black hole while evaluating (matches the old
+            // single-threaded behaviour, so isBlackhole() and error
+            // messages still see "a black hole"). Recursion is detected
+            // via the thread id stored in the state, not this marker.
+            thunk.expr = &eBlackHole;
+            try {
+                v = expr->eval(state, *env);
+                auto old = thunk.publish(v);
+                if ((old & ThunkStateMask) == static_cast<uint32_t>(ThunkState::Awaited)) {
+                    notifyThunkWaiters(thunk);
+                }
+            } catch (...) {
+                thunk._env = env;
+                thunk.expr = expr;
+                auto old = thunk.state.exchange(
+                    static_cast<uint32_t>(ThunkState::Unevaluated), std::memory_order_release
+                );
+                if ((old & ThunkStateMask) == static_cast<uint32_t>(ThunkState::Awaited)) {
+                    notifyThunkWaiters(thunk);
+                }
+                state.tryFixupBlackHolePos(v, pos);
+                throw;
+            }
+            return;
+        }
+
+        default: { // Evaluating or Awaited: another thread has it.
+            auto id = st >> ThunkIdShift;
+            if (id == getMyEvalThreadId()) {
+                state.ctx.errors.make<InfiniteRecursionError>("infinite recursion encountered")
+                    .atPos(pos)
+                    .debugThrow();
+            }
+            // Mark the thunk as waited-on so the winner wakes us, then
+            // block until it leaves the Awaited state.
+            uint32_t expected = st;
+            if (thunk.state.compare_exchange_weak(
+                    expected,
+                    static_cast<uint32_t>(ThunkState::Awaited) | (id << ThunkIdShift),
+                    std::memory_order_acquire,
+                    std::memory_order_acquire
+                ))
+            {
+                waitOnThunk(thunk);
+            }
+            // If the CAS failed, the state changed under us (e.g. the
+            // winner finished); loop and re-read.
+            continue;
+        }
+        }
+    }
+}
+
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
@@ -196,20 +284,9 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         auto & thunk = v.thunk();
         if (thunk.resolved()) {
             v = thunk.result();
-        } else {
-            const auto backup = thunk;
-            Env * env = thunk.env();
-            Expr & expr = *thunk.expr;
-            thunk = Value::blackHole;
-            try {
-                v = expr.eval(*this, *env);
-                thunk.resolve(v);
-            } catch (...) {
-                thunk = backup;
-                tryFixupBlackHolePos(v, pos);
-                throw;
-            }
+            return;
         }
+        forceThunk(*this, v, thunk, pos);
     } else if (v.isApp()) {
         auto & app = v.app();
         if (app.resolved()) {

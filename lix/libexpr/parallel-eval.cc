@@ -1,5 +1,6 @@
 #include "lix/libexpr/parallel-eval.hh"
 #include "lix/libexpr/eval-settings.hh"
+#include "lix/libexpr/thunk-wait.hh"
 #include "lix/libstore/globals.hh"
 #include "lix/libutil/logging.hh"
 #include "lix/libutil/signals.hh"
@@ -26,6 +27,9 @@ Executor::Executor(const EvalSettings & evalSettings)
     , interruptCallback(createInterruptCallback([&]() {
         quit = true;
         wakeup.notify_all();
+        // Wake any threads blocked waiting on a thunk so they can
+        // observe the interrupt and unwind.
+        wakeAllThunkWaiters();
     }))
 {
 #if HAVE_BOEHMGC

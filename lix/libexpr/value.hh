@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include <atomic>
 #include <cassert>
 #include <climits>
 #include <cstdint>
@@ -875,6 +876,34 @@ public:
     }
 };
 
+/**
+ * State of a thunk in the parallel evaluator.
+ *
+ * Transitions (see forceValue in eval-inline.hh):
+ *
+ *   Unevaluated --(CAS claim)--> Evaluating --(publish)--> Resolved
+ *       ^                              |
+ *       |                         (another thread
+ *       |                          forces)
+ *       |                              v
+ *       +------(revert on error)---- Awaited --(wake)--> (re-check)
+ *
+ * While state is Evaluating or Awaited, the bits above @ref
+ * ThunkIdShift hold the id of the thread evaluating the thunk; a
+ * thread that observes its own id there is recursively forcing a
+ * thunk it is currently evaluating and raises InfiniteRecursionError
+ * instead of waiting (which would deadlock).
+ */
+enum class ThunkState : uint32_t {
+    Unevaluated = 0,
+    Evaluating = 1,
+    Awaited = 2,
+    Resolved = 3,
+};
+
+constexpr uint32_t ThunkStateMask = 0x3;
+constexpr uint32_t ThunkIdShift = 2;
+
 struct alignas(Value::TAG_ALIGN) Value::Thunk
 {
     union {
@@ -883,15 +912,38 @@ struct alignas(Value::TAG_ALIGN) Value::Thunk
     };
     Expr * expr;
 
+    /**
+     * Evaluation state for the parallel evaluator: bits 0-1 are a
+     * ThunkState, bits 2+ are the id of the evaluating thread while
+     * the state is Evaluating or Awaited. See @ref ThunkState.
+     */
+    std::atomic<uint32_t> state{static_cast<uint32_t>(ThunkState::Unevaluated)};
+
     bool resolved() const
     {
-        return expr == nullptr;
+        return (state.load(std::memory_order_acquire) & ThunkStateMask)
+            == static_cast<uint32_t>(ThunkState::Resolved);
     }
 
     void resolve(Value v)
     {
         _result = v;
         expr = nullptr;
+    }
+
+    /**
+     * Publish the result of evaluating this thunk: store the value,
+     * then flip the state to Resolved with release semantics (so
+     * waiters observing Resolved with acquire see the result).
+     *
+     * Returns the previous state word, so the caller can wake waiters
+     * if the previous state was Awaited.
+     */
+    uint32_t publish(Value v)
+    {
+        _result = v;
+        expr = nullptr;
+        return state.exchange(static_cast<uint32_t>(ThunkState::Resolved), std::memory_order_release);
     }
 
     Env * env() const

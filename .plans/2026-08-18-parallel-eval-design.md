@@ -1,7 +1,7 @@
 # Parallel Evaluation for the Lix homelab fork — design doc
 
 Date: 2026-08-18
-Status: approved-for-implementation (Stage 1 in progress)
+Status: Stage 1 ✅ committed (c3306449f), Stage 2 ✅ committed (see below)
 Base: `homelab/2.96` rebased onto upstream `main` (`3470ce4d5`), 15 homelab commits reapplied.
 
 ## 1. Goal
@@ -98,44 +98,56 @@ Deliverable: `lix/libexpr/parallel-eval.hh` + `.cc` (mirrors Determinate, adapte
   libutil or local to the executor header).
 - Not wired into the evaluator yet; builds and unit-tests standalone.
 
-### Stage 2 — Atomic thunk state machine (the core surgery)
+### Stage 2 — Atomic thunk state machine (DONE, committed)
 
-Extend `Value::Thunk` with a state + waiter coordination:
+Implemented exactly as designed below, with one refinement: same-thread recursion is
+detected via the **evaluating thread's id stored in the state word** (bits 2+), mirroring
+Determinate's `threadId` in `p0` — no separate thread-local guard set is needed. The
+`eBlackHole` marker is still written while evaluating so `isBlackhole()` and error messages
+behave as before.
 
 ```cpp
-enum class ThunkState : uint8_t { Unevaluated, Evaluating, Awaited, Resolved };
+enum class ThunkState : uint32_t { Unevaluated = 0, Evaluating = 1, Awaited = 2, Resolved = 3 };
+constexpr uint32_t ThunkStateMask = 0x3;
+constexpr uint32_t ThunkIdShift = 2;
 
 struct Value::Thunk {
-    Expr * expr;                        // becomes atomic; nullptr == resolved
     union { Env * _env; Value _result; };
-    std::atomic<ThunkState> state;      // published with release
-    // waiter coordination: futex-style counter or small intrusive wait list
+    Expr * expr;
+    std::atomic<uint32_t> state;   // bits 0-1: ThunkState; bits 2+: evaluating thread id
 };
 ```
 
 Force protocol (per thread):
 
 1. Read thunk state (acquire).
-2. `Unevaluated` → CAS to `Evaluating`; **winner** copies env/expr out (like today) and
-   evaluates. On completion: `resolve(v)` writes `_result`, then `state` → `Resolved`
-   (release), then wakes waiters iff the CAS saw a transition to `Awaited`.
-3. `Evaluating`/`Awaited` (another thread is evaluating) → CAS `Evaluating→Awaited`, then
-   block on the thunk's wait primitive until `Resolved`, then copy `_result` (acquire).
-4. `Resolved` → copy `_result` (acquire).
+2. `Resolved` → copy `_result` (acquire).
+3. `Unevaluated` → CAS to `Evaluating | (myId << 2)`; **winner** copies env/expr out,
+   writes the `eBlackHole` marker, evaluates. On success `publish(v)` stores `_result`,
+   nulls `expr`, exchanges state → `Resolved` (release), and wakes waiters iff the
+   exchange returned an `Awaited` state. On exception: restores env/expr, exchanges
+   state → `Unevaluated` (release), wakes waiters iff it was `Awaited`, rethrows.
+4. `Evaluating`/`Awaited` → if the stored id == my id: `InfiniteRecursionError` (same-thread
+   recursion). Else CAS → `Awaited | (id << 2)` (weak), then `waitOnThunk()` blocks on a
+   sharded waiter-domain cv until the state leaves `Awaited`; loop.
 
-Recursion: **same-thread recursion must still abort** (Lix semantics: infinite recursion is
-an error, not a hang). Keep a `thread_local` guard set of `Thunk*` currently being evaluated
-by this thread; forcing one already in the set raises `InfiniteRecursionError` as today.
-Cross-thread forcing waits instead.
+Waiter domains: `std::array<Sync<WaiterDomain>, 128>` keyed by thunk address (`>> 5 % 128`),
+exactly like Determinate. `wakeAllThunkWaiters()` is invoked by the Executor's interrupt
+callback so blocked waiters unwind on SIGINT. New files: `lix/libexpr/thunk-wait.{hh,cc}`.
 
-App resolution (`Value::App`, `_n == ~0` = resolved): leave single-threaded in Stage 2 —
-apps are shallow (primop application), the win is in thunk/attrset forcing. Parallelize in
-Stage 3 if profiling shows value.
+App resolution (`Value::App`, `_n == ~0` = resolved): left single-threaded in Stage 2.
 
-Slot publication: the evaluating thread still writes its result into the local `Value & v`
-slot for its own caller; waiters must **never read the slot after observing Evaluating** —
-they read `Thunk::_result` (acquire) and copy it into their own slot. The slot write is
-pointer-sized and idempotent; the acquire/release on `Thunk::state` orders it.
+Slot publication: the winner writes its result into its own `Value & v` slot; waiters never
+read the slot after observing `Evaluating` — they read `Thunk::_result` (acquire) and copy
+it into their slot. The slot write is pointer-sized and idempotent.
+
+Known limitation (same as Determinate): a **cross-thread thunk cycle** (thread A waits on
+B's thunk while B waits on A's) deadlocks — thread-id detection only catches same-thread
+cycles. Pathological Nix only; accepted for now.
+
+Measured: no single-threaded regression. A/B of the zephyr toplevel eval (Stage 1 binary
+vs Stage 2 binary, same build config, alternating under load): median 25.6 s vs 25.5 s —
+the atomic machinery is effectively free on this workload.
 
 ### Stage 3 — Parallel primitives + wiring
 
