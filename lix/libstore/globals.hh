@@ -96,7 +96,11 @@ class Settings : public Config
 {
     std::list<daemon::Protocol> nixDaemonSockets_;
 
+public:
+
     unsigned int getDefaultCores();
+
+private:
 
     StringSet getDefaultSystemFeatures();
 

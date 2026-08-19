@@ -202,6 +202,7 @@ libexpr_tests_sources = files(
   'libexpr/error_traces.cc',
   'libexpr/flakeref.cc',
   'libexpr/json.cc',
+  'libexpr/parallel-eval.cc',
   'libexpr/primops.cc',
   'libexpr/search-path.cc',
   'libexpr/trivial.cc',

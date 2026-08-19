@@ -7,6 +7,9 @@ plugin_mtls_store = shared_module(
     liblix.partial_dependency(includes : true, compile_args : true),
     curl,
   ],
+  # Propagate the generated zngur bridge headers as sources so this
+  # plugin waits for the codegen target (see lix/meson.build).
+  sources : liblix_generated_headers,
   install : false,
   build_by_default : true,
   link_args : plugin_link_args,
