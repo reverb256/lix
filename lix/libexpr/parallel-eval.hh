@@ -171,13 +171,19 @@ struct Executor
 };
 
 /**
- * Force a value deeply, in parallel, using the evaluation executor.
- * Spawns one work item per attribute value / list element so the
- * executor evaluates them concurrently; the caller's subsequent
- * sequential walk then reads already-forced values (blocking on any
- * in-flight work via the thunk waiter machinery). Used by the JSON
- * value printer (nix eval --json) and flake check. Ported from
- * Determinate Nix.
+ * Force a value deeply, using the evaluation executor.
+ *
+ * Only children whose forcing is likely to block on store/async I/O
+ * (derivations, fetches, path realisation) are spawned as background
+ * work items, so their blocking overlaps other work. Everything else
+ * (pure computation) is forced inline on the walking thread, because
+ * running many allocation-heavy thunks concurrently contends on the
+ * Boehm GC's allocation lock and is slower than serial evaluation.
+ *
+ * The caller's subsequent sequential walk then reads already-forced
+ * values (blocking on any in-flight work via the thunk waiter
+ * machinery). Used by the JSON value printer (nix eval --json) and
+ * flake check.
  */
 void parallelForceDeep(EvalState & state, Value & v, PosIdx pos);
 

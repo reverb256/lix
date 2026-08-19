@@ -1,6 +1,7 @@
 #include "lix/libexpr/parallel-eval.hh"
 #include "lix/libexpr/eval-inline.hh" // IWYU pragma: keep
 #include "lix/libexpr/eval-settings.hh"
+#include "lix/libexpr/nixexpr.hh"
 #include "lix/libexpr/primops.hh"
 #include "lix/libexpr/thunk-wait.hh"
 #include "lix/libstore/globals.hh"
@@ -11,7 +12,9 @@
 #include <kj/exception.h>
 
 #include <algorithm>
+#include <array>
 #include <exception>
+#include <string_view>
 #include <utility>
 
 namespace nix {
@@ -268,18 +271,144 @@ void FutureVector::finishAll()
 }
 
 /**
- * Whether a value can still have unforced children and therefore is
- * worth scheduling as a background work item. Values already in normal
- * form (ints, strings, paths, lambdas, ...) are skipped so we don't
- * enqueue no-op work items, which are pure queue/allocator overhead.
+ * Whether forcing a value (an unresolved thunk or a pending function
+ * application) is likely to perform store/async I/O (path copying,
+ * derivation writing/realisation, fetching), which blocks and therefore
+ * overlaps well across worker threads. Pure computation is deliberately
+ * excluded so it stays on the walking thread and does not contend on the
+ * Boehm GC's global allocation lock (running many allocation-heavy thunks
+ * concurrently is *slower* than serially).
+ *
+ * This is a shallow, conservative syntactic test: it recognises direct
+ * store builtins and `drvPath`/`outPath` selects, following lambda bodies
+ * so pending applications like `builtins.map (d: d.drvPath) ...` are
+ * caught. Deeper wrappers (e.g. `stdenv.mkDerivation`) are forced inline,
+ * and their store work still happens nested inside a recognised
+ * `drvPath`/`outPath` work item.
  */
-static bool needsWork(const Value & v)
+
+/** Store/async-bound builtins, by their user-visible name (after the
+ * `__` registration prefix is stripped). */
+static bool isStoreBoundBuiltin(std::string_view name)
 {
-    switch (v.type()) {
+    static const std::array<std::string_view, 17> names = {
+        "derivation",
+        "derivationStrict",
+        "fetchGit",
+        "fetchMercurial",
+        "fetchTarball",
+        "fetchTree",
+        "fetchurl",
+        "filterSource",
+        "import",
+        "scopedImport",
+        "path",
+        "pathExists",
+        "readDir",
+        "readFile",
+        "storePath",
+        "toFile",
+        "toPath",
+    };
+    return std::find(names.begin(), names.end(), name) != names.end();
+}
+
+static bool isStoreBoundExpr(EvalState & state, Expr & e)
+{
+    // A lambda's store work happens in its body when it is applied.
+    if (auto * lambda = e.try_cast<ExprLambda>()) {
+        return isStoreBoundExpr(state, *lambda->body);
+    }
+
+    // A call to a store-bound builtin, either bare (`derivation { ... }`,
+    // `import ./x.nix`) or via the `builtins` attrset
+    // (`builtins.fetchTarball { ... }`).
+    if (auto * call = e.try_cast<ExprCall>()) {
+        Expr & fun = *call->fun;
+        if (auto * var = fun.try_cast<ExprVar>()) {
+            if (isStoreBoundBuiltin(state.ctx.symbols[var->name])) {
+                return true;
+            }
+        } else if (auto * sel = fun.try_cast<ExprSelect>()) {
+            if (sel->attrPath.size() == 1 && !sel->attrPath[0].isDynamic()) {
+                if (auto * base = sel->e->try_cast<ExprVar>()) {
+                    if (state.ctx.symbols[base->name] == "builtins"
+                        && isStoreBoundBuiltin(state.ctx.symbols[sel->attrPath[0].symbol]))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Selecting `drvPath`/`outPath` writes or realises a derivation.
+    if (auto * sel = e.try_cast<ExprSelect>()) {
+        if (sel->attrPath.size() == 1 && !sel->attrPath[0].isDynamic()) {
+            std::string_view name = state.ctx.symbols[sel->attrPath[0].symbol];
+            if (name == "drvPath" || name == "outPath") {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool isStoreBoundValue(EvalState & state, const Value & v)
+{
+    // A real thunk (internalType tThunk) has an `expr` to inspect. Note
+    // `type()` reports nThunk for both unresolved thunks and pending
+    // function applications (App values), so it cannot be used here.
+    if (v.isThunk() && !v.thunk().resolved()) {
+        Expr * e = v.thunk().expr;
+        return e != nullptr && isStoreBoundExpr(state, *e);
+    }
+    // A pending function application (e.g. every element of a
+    // `builtins.map (d: d.drvPath) ...` result is an App): inspect the
+    // applied lambda's body for store work.
+    if (v.isApp()) {
+        const Value & target = v.app().target();
+        if (target.isLambda()) {
+            if (auto * lambda = target.lambda().fun) {
+                return isStoreBoundExpr(state, *lambda->body);
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Schedule forcing `child`: spawn a worker item when it is a thunk likely
+ * to block on store/async I/O (so the block overlaps other work), otherwise
+ * force it inline on the current thread. Values already in normal form
+ * (ints, strings, paths, lambdas, ...) are skipped.
+ */
+static void dispatchChild(EvalState & state, Value & child, PosIdx pos, Executor::WorkItems & work)
+{
+    switch (child.type()) {
     case nThunk:
+        // `type()` reports nThunk for both unresolved thunks and pending
+        // function applications (App values); isStoreBoundValue() tells
+        // them apart and classifies both.
+        if (isStoreBoundValue(state, child)) {
+            // allocRootValue makes a GC-rooted copy of the Value so the
+            // graph stays alive for the whole duration of the work item
+            // even if the top-level value goes out of scope (the executor
+            // is not waited on explicitly).
+            work.emplace_back(
+                [value = allocRootValue(child), pos, &state]() { parallelForceDeep(state, *value, pos); }, 0
+            );
+        } else {
+            parallelForceDeep(state, child, pos);
+        }
+        break;
     case nAttrs:
     case nList:
-        return true;
+        // Already forced to normal form; walking its children is cheap and
+        // discovers store-bound descendants to spawn, so do it inline.
+        parallelForceDeep(state, child, pos);
+        break;
     case nInt:
     case nFloat:
     case nBool:
@@ -288,11 +417,9 @@ static bool needsWork(const Value & v)
     case nNull:
     case nExternal:
     case nFunction:
-        return false;
+        // Already in normal form: nothing left to force.
+        break;
     }
-    // All ValueType enumerators are handled above; only reachable if
-    // `type()` ever returns an out-of-range value.
-    return false;
 }
 
 void parallelForceDeep(EvalState & state, Value & v, PosIdx pos)
@@ -312,31 +439,14 @@ void parallelForceDeep(EvalState & state, Value & v, PosIdx pos)
             return;
         }
         for (auto & a : *v.attrs()) {
-            if (!needsWork(a.value)) {
-                continue;
-            }
-            // allocRootValue makes a GC-rooted copy of the Value so
-            // the graph stays alive for the whole duration of the
-            // work item even if the top-level value goes out of
-            // scope (the executor is not waited on explicitly).
-            work.emplace_back(
-                [value = allocRootValue(a.value), pos = a.pos, &state]() {
-                    parallelForceDeep(state, *value, pos);
-                },
-                0
-            );
+            dispatchChild(state, a.value, a.pos, work);
         }
         break;
     }
 
     case nList: {
         for (auto & elem : v.listItems()) {
-            if (!needsWork(elem)) {
-                continue;
-            }
-            work.emplace_back(
-                [value = allocRootValue(elem), &state]() { parallelForceDeep(state, *value, noPos); }, 0
-            );
+            dispatchChild(state, elem, noPos, work);
         }
         break;
     }
