@@ -30,6 +30,10 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The regression gate benchmarks against the previous commit,
+          # so we need more than the default shallow fetch.
+          fetch-depth: 0
 
       - name: Enable reverb-os cachix
         uses: cachix/cachix-action@v15
@@ -53,8 +57,26 @@ jobs:
           # self-hosted runner and makes CI die with the remote builder.
           nix build .#nix --print-out-paths --builders ""
 
+      - name: Benchmark (eval regression gate)
+        id: bench
+        run: |
+          set -euo pipefail
+          # Candidate is already built (cached), so this is just a link.
+          nix build .#nix --builders "" -o result-new
+
+          if ! git rev-parse --quiet --verify HEAD~1 >/dev/null; then
+            echo "No previous commit to compare against; skipping regression gate."
+            exit 0
+          fi
+
+          # Baseline: the previous commit's Lix, built the same way.
+          prev="$(git rev-parse HEAD~1)"
+          nix build "git+file:$PWD?rev=$prev#nix" --builders "" -o result-base
+
+          ./bench/regression-gate.sh result-base result-new
+
       - name: Push outputs to reverb-os cachix
-        if: steps.build.outcome == 'success'
+        if: steps.build.outcome == 'success' && steps.bench.outcome == 'success'
         run: |
           set -euo pipefail
           nix path-info .#nix | xargs -r cachix push reverb-os

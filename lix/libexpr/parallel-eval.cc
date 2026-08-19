@@ -7,6 +7,8 @@
 #include "lix/libutil/logging.hh"
 #include "lix/libutil/signals.hh"
 
+#include <kj/exception.h>
+
 #include <algorithm>
 #include <exception>
 #include <utility>
@@ -144,6 +146,14 @@ void Executor::worker()
         } catch (const Interrupted &) {
             quit = true;
             item.promise.set_exception(std::current_exception());
+        } catch (const kj::Exception & e) {
+            // kj::Exception objects are thread-affine: ExceptionImpl
+            // registers itself in a thread-local in-flight list and its
+            // destructor aborts if it is destroyed on a different thread
+            // than the one that threw it. Never let one cross the worker
+            // boundary; convert it to a nix::Error (a plain std::exception)
+            // so the main thread can safely rethrow it.
+            item.promise.set_exception(std::make_exception_ptr(Error(e.getDescription().cStr())));
         } catch (...) {
             item.promise.set_exception(std::current_exception());
         }
@@ -232,6 +242,34 @@ void FutureVector::finishAll()
     }
 }
 
+/**
+ * Whether a value can still have unforced children and therefore is
+ * worth scheduling as a background work item. Values already in normal
+ * form (ints, strings, paths, lambdas, ...) are skipped so we don't
+ * enqueue no-op work items, which are pure queue/allocator overhead.
+ */
+static bool needsWork(const Value & v)
+{
+    switch (v.type()) {
+    case nThunk:
+    case nAttrs:
+    case nList:
+        return true;
+    case nInt:
+    case nFloat:
+    case nBool:
+    case nString:
+    case nPath:
+    case nNull:
+    case nExternal:
+    case nFunction:
+        return false;
+    }
+    // All ValueType enumerators are handled above; only reachable if
+    // `type()` ever returns an out-of-range value.
+    return false;
+}
+
 void parallelForceDeep(EvalState & state, Value & v, PosIdx pos)
 {
     state.forceValue(v, pos);
@@ -249,6 +287,9 @@ void parallelForceDeep(EvalState & state, Value & v, PosIdx pos)
             return;
         }
         for (auto & a : *v.attrs()) {
+            if (!needsWork(a.value)) {
+                continue;
+            }
             // allocRootValue makes a GC-rooted copy of the Value so
             // the graph stays alive for the whole duration of the
             // work item even if the top-level value goes out of
@@ -265,6 +306,9 @@ void parallelForceDeep(EvalState & state, Value & v, PosIdx pos)
 
     case nList: {
         for (auto & elem : v.listItems()) {
+            if (!needsWork(elem)) {
+                continue;
+            }
             work.emplace_back(
                 [value = allocRootValue(elem), &state]() { parallelForceDeep(state, *value, noPos); }, 0
             );

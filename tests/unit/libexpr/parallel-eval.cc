@@ -5,6 +5,8 @@
 #include "lix/libutil/error.hh"
 #include "lix/libutil/logging.hh"
 
+#include <kj/exception.h>
+
 #include <gtest/gtest.h>
 
 #include "tests/libexpr.hh"
@@ -277,6 +279,28 @@ TEST_F(ExecutorTest, exceptionsPropagate)
 
     Executor::WorkItems items;
     items.emplace_back([] { throw Error("boom"); }, 0);
+
+    auto futures = executor.spawn(std::move(items));
+    ASSERT_THROW(futures[0].get(), Error);
+}
+
+TEST_F(ExecutorTest, kjExceptionFromWorkerIsConverted)
+{
+    // A kj::Exception thrown by a worker must not cross the thread
+    // boundary as-is: kj::ExceptionImpl is thread-affine (its destructor
+    // aborts if destroyed on a different thread than the one that threw
+    // it). The executor must convert it to a nix::Error first.
+    EvalSettings evalSettings;
+    evalSettings.set("eval-cores", "2");
+    Executor executor(evalSettings);
+
+    Executor::WorkItems items;
+    items.emplace_back(
+        [] {
+            throw kj::Exception(kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str("no event loop"));
+        },
+        0
+    );
 
     auto futures = executor.spawn(std::move(items));
     ASSERT_THROW(futures[0].get(), Error);

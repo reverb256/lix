@@ -432,7 +432,16 @@ EvalState::~EvalState()
     // work items never observe a partially-destroyed EvalState (the
     // executor lives in `ctx` and may be destroyed shortly after we are).
     if (futures) {
-        futures->finishAll();
+        try {
+            futures->finishAll();
+        } catch (...) {
+            // Never let an exception escape a destructor (it is implicitly
+            // noexcept, so rethrowing here would terminate). The errors are
+            // redundant anyway: a failed work item reverts its thunk to
+            // Unevaluated, so the main thread re-forces it and rethrows the
+            // error through the normal evaluation path.
+            ignoreExceptionInDestructor(lvlDebug);
+        }
     }
     ctx.activeEval = nullptr;
 }
