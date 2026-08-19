@@ -7,10 +7,24 @@
 
 namespace nix {
 
-JSON printValueAsJSON(EvalState & state, bool strict,
-    Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore = true);
+JSON printValueAsJSON(
+    EvalState & state,
+    bool strict,
+    Value & v,
+    const PosIdx pos,
+    NixStringContext & context,
+    bool copyToStore = true,
+    bool parallel = true
+);
 
-void printValueAsJSON(EvalState & state, bool strict,
-    Value & v, const PosIdx pos, std::ostream & str, NixStringContext & context, bool copyToStore = true);
-
+void printValueAsJSON(
+    EvalState & state,
+    bool strict,
+    Value & v,
+    const PosIdx pos,
+    std::ostream & str,
+    NixStringContext & context,
+    bool copyToStore = true,
+    bool parallel = true
+);
 }

@@ -1123,7 +1123,7 @@ static Value derivationStrictInternal(EvalState & state, const std::string & drv
                     }
 
                     (*jsonObject)[std::string(key)] =
-                        printValueAsJSON(state, true, i->value, noPos, context);
+                        printValueAsJSON(state, true, i->value, noPos, context, true, false);
 
                     if (i->name == state.ctx.symbols.sym_builder) {
                         drv.builder = state.forceString(i->value, context, noPos, context_below);
@@ -1691,7 +1691,14 @@ static Value prim_toJSON(EvalState & state, Value ** args)
 {
     std::ostringstream out;
     NixStringContext context;
-    printValueAsJSON(state, true, *args[0], noPos, out, context);
+    // Serialize without the parallel deep-force: builtins.toJSON is
+    // called frequently during evaluation (hundreds of times in nixpkgs)
+    // and its value is usually a small, already-forced structure, so
+    // spawning a parallel fan-out here only adds queue/allocator overhead
+    // (and contends on the store's async mutex for derivations). The
+    // parallel deep-force remains opt-in for the top-level `nix eval --json`
+    // output path.
+    printValueAsJSON(state, true, *args[0], noPos, out, context, true, false);
     return {NewValueAs::string, out.str(), context};
 }
 

@@ -10,13 +10,20 @@
 
 namespace nix {
 
-JSON printValueAsJSON(EvalState & state, bool strict,
-    Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore)
+JSON printValueAsJSON(
+    EvalState & state,
+    bool strict,
+    Value & v,
+    const PosIdx pos,
+    NixStringContext & context,
+    bool copyToStore,
+    bool parallel
+)
 {
     checkInterrupt();
 
     if (strict) {
-        if (state.ctx.parallelEvalEnabled() && !Executor::amWorkerThread) {
+        if (parallel && state.ctx.parallelEvalEnabled() && !Executor::amWorkerThread) {
             parallelForceDeep(state, v, pos);
         } else {
             state.forceValue(v, pos);
@@ -69,8 +76,7 @@ JSON printValueAsJSON(EvalState & state, bool strict,
                 for (auto & j : names) {
                     const Attr & a(*v.attrs()->get(state.ctx.symbols.create(j)));
                     try {
-                        out[j] =
-                            printValueAsJSON(state, strict, a.value, a.pos, context, copyToStore);
+                        out[j] = printValueAsJSON(state, strict, a.value, a.pos, context, copyToStore, false);
                     } catch (Error & e) {
                         e.addTrace(
                             state.ctx.positions[a.pos],
@@ -80,7 +86,7 @@ JSON printValueAsJSON(EvalState & state, bool strict,
                     }
                 }
             } else {
-                return printValueAsJSON(state, strict, i->value, i->pos, context, copyToStore);
+                return printValueAsJSON(state, strict, i->value, i->pos, context, copyToStore, false);
             }
             break;
         }
@@ -90,7 +96,7 @@ JSON printValueAsJSON(EvalState & state, bool strict,
             int i = 0;
             for (auto elem : v.listItems()) {
                 try {
-                    out.push_back(printValueAsJSON(state, strict, elem, pos, context, copyToStore));
+                    out.push_back(printValueAsJSON(state, strict, elem, pos, context, copyToStore, false));
                 } catch (Error & e) {
                     e.addTrace(state.ctx.positions[pos],
                         HintFmt("while evaluating list element at index %1%", i));
@@ -121,10 +127,18 @@ JSON printValueAsJSON(EvalState & state, bool strict,
     return out;
 }
 
-void printValueAsJSON(EvalState & state, bool strict,
-    Value & v, const PosIdx pos, std::ostream & str, NixStringContext & context, bool copyToStore)
+void printValueAsJSON(
+    EvalState & state,
+    bool strict,
+    Value & v,
+    const PosIdx pos,
+    std::ostream & str,
+    NixStringContext & context,
+    bool copyToStore,
+    bool parallel
+)
 {
-    str << printValueAsJSON(state, strict, v, pos, context, copyToStore);
+    str << printValueAsJSON(state, strict, v, pos, context, copyToStore, parallel);
 }
 
 JSON ExternalValueBase::printValueAsJSON(EvalState & state, bool strict,
