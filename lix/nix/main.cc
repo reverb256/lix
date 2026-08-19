@@ -74,6 +74,10 @@
 #include <netdb.h>
 #include <netinet/in.h>
 
+#include <exception>
+#include <pthread.h>
+#include <system_error>
+
 namespace nix {
 
 void registerLegacyCommands()
@@ -660,7 +664,62 @@ int main(int argc, char * * argv)
     }
 
     return nix::handleExceptions(argv[0], [&]() {
-        nix::AsyncIoRoot aio;
-        return nix::mainWrapped(aio, argc, argv);
+        // Evaluation is deeply recursive, and the -O3 release flags grow
+        // stack frames enough that the default 8 MiB process stack cannot
+        // reach the maxCallDepth (default 10000) guard before overflowing.
+        // The process's main-thread stack is fixed at exec time and cannot
+        // grow, so run the actual command on a dedicated thread with the
+        // same generous stack as the parallel evaluator's workers
+        // (evalStackSize in libexpr/parallel-eval.hh).
+        struct MainArgs
+        {
+            int argc;
+            char ** argv;
+            int result = 0;
+            std::exception_ptr ex;
+        };
+
+        MainArgs args{argc, argv};
+
+        pthread_attr_t attrs;
+        if (pthread_attr_init(&attrs) != 0) {
+            throw nix::Error("could not initialize main thread attributes");
+        }
+        if (pthread_attr_setstacksize(&attrs, 60 * 1024 * 1024) != 0) {
+            pthread_attr_destroy(&attrs);
+            throw nix::Error("could not set main thread stack size");
+        }
+
+        pthread_t thread;
+        auto ret = pthread_create(
+            &thread,
+            &attrs,
+            [](void * arg) -> void * {
+                auto * args = static_cast<MainArgs *>(arg);
+                try {
+                    nix::AsyncIoRoot aio;
+                    args->result = nix::mainWrapped(aio, args->argc, args->argv);
+                } catch (...) {
+                    args->ex = std::current_exception();
+                }
+                return nullptr;
+            },
+            &args
+        );
+        pthread_attr_destroy(&attrs);
+        if (ret != 0) {
+            throw nix::Error(
+                "could not create main work thread: %1%",
+                std::system_error(ret, std::generic_category()).what()
+            );
+        }
+
+        if (pthread_join(thread, nullptr) != 0) {
+            throw nix::Error("could not join main work thread");
+        }
+        if (args.ex) {
+            std::rethrow_exception(args.ex);
+        }
+        return args.result;
     });
 }
