@@ -4,6 +4,7 @@
 #include "lix/libexpr/primops.hh"
 #include "lix/libexpr/thunk-wait.hh"
 #include "lix/libstore/globals.hh"
+#include "lix/libutil/async.hh"
 #include "lix/libutil/logging.hh"
 #include "lix/libutil/signals.hh"
 
@@ -116,6 +117,18 @@ void Executor::worker()
 
     amWorkerThread = true;
 
+    // Give this worker its own kj event loop. The evaluator's store
+    // interactions (writeDerivation/addToStore/readDerivation, ...) are
+    // async (kj::Promise) and their internal locks are kj async mutexes
+    // (Sync<T, AsyncMutex>), so any of them requires an event loop on the
+    // calling thread. Without this, `AIO()`/`co_await` on a worker throws
+    // "No event loop is running on this thread" and the work item fails.
+    // This mirrors Lix's own ThreadPool::doWork(), which gives every
+    // worker its own AsyncIoRoot; AsyncIoRoot::blockOn() is thread-agnostic
+    // (it waits on the thread-local kj::waitScope), so the existing
+    // state.aio.blockOn(...) call sites work unchanged.
+    AsyncIoRoot aio;
+
     while (true) {
         Item item;
 
@@ -154,6 +167,18 @@ void Executor::worker()
             // boundary; convert it to a nix::Error (a plain std::exception)
             // so the main thread can safely rethrow it.
             item.promise.set_exception(std::make_exception_ptr(Error(e.getDescription().cStr())));
+        } catch (const ForeignException & e) {
+            // A rejected async operation (e.g. a store call) surfaces as a
+            // kj::Exception, which AsyncIoRoot::blockOn() then wraps in a
+            // ForeignException (its `inner` is an exception_ptr to the
+            // thread-affine kj::ExceptionImpl). Unwrap it and convert to a
+            // plain Error so the kj::Exception is released on this worker
+            // thread instead of on the main thread.
+            if (auto * kje = e.as<kj::Exception>()) {
+                item.promise.set_exception(std::make_exception_ptr(Error(kje->getDescription().cStr())));
+            } else {
+                item.promise.set_exception(std::current_exception());
+            }
         } catch (...) {
             item.promise.set_exception(std::current_exception());
         }

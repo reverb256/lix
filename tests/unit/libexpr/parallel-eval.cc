@@ -306,6 +306,35 @@ TEST_F(ExecutorTest, kjExceptionFromWorkerIsConverted)
     ASSERT_THROW(futures[0].get(), Error);
 }
 
+TEST_F(ExecutorTest, foreignExceptionWrappingKjIsConverted)
+{
+    // AsyncIoRoot::blockOn() wraps a rejected promise's kj::Exception in a
+    // nix::ForeignException (whose `inner` is an exception_ptr to the
+    // thread-affine kj::ExceptionImpl). The executor must unwrap that too,
+    // otherwise the kj::ExceptionImpl is released on the main thread and
+    // aborts in its destructor.
+    EvalSettings evalSettings;
+    evalSettings.set("eval-cores", "2");
+    Executor executor(evalSettings);
+
+    Executor::WorkItems items;
+    items.emplace_back(
+        [] {
+            try {
+                throw kj::Exception(
+                    kj::Exception::Type::FAILED, __FILE__, __LINE__, kj::str("store op failed")
+                );
+            } catch (...) {
+                throw ForeignException::wrapCurrent();
+            }
+        },
+        0
+    );
+
+    auto futures = executor.spawn(std::move(items));
+    ASSERT_THROW(futures[0].get(), Error);
+}
+
 TEST_F(ExecutorTest, singleCoreDisables)
 {
     EvalSettings evalSettings;
