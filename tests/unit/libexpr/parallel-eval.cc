@@ -71,16 +71,23 @@ class ParallelEvalTest : public LibExprTest
 protected:
     /**
      * Builds a fresh, slow thunk: `let go = n: if n == 0 then
-     * builtins.trace "EVALED" 42 else go (n - 1); in { a = go 9500; }`
-     * (kept under the default maxCallDepth of 10000). The trace fires
+     * builtins.trace "EVALED" 42 else go (n - 1); in { a = go 4000; }`
+     * (well under the default maxCallDepth of 10000). The trace fires
      * exactly once per evaluation, so counting "EVALED" proves how
      * many threads evaluated the thunk.
+     *
+     * Depth is capped at 4000 rather than 9500: each recursion level
+     * costs several C++ stack frames, and at -O3 (the homelab release
+     * flags) the frames are large enough that `go 9500` overflows the
+     * 8 MiB default std::thread stack before the Nix-level callDepth
+     * guard trips. The executor's workers use a 60 MiB stack (see
+     * evalStackSize); raw std::threads in these tests do not.
      */
     Value slowThunk()
     {
         auto v = eval(
             "let go = n: if n == 0 then builtins.trace \"EVALED\" 42 else go (n - 1); "
-            "in { a = go 9500; }",
+            "in { a = go 4000; }",
             false
         );
         return v;
