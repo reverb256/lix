@@ -1,5 +1,7 @@
 #include "lix/libexpr/parallel-eval.hh"
+#include "lix/libexpr/eval-inline.hh" // IWYU pragma: keep
 #include "lix/libexpr/eval-settings.hh"
+#include "lix/libexpr/primops.hh"
 #include "lix/libexpr/thunk-wait.hh"
 #include "lix/libstore/globals.hh"
 #include "lix/libutil/logging.hh"
@@ -228,6 +230,93 @@ void FutureVector::finishAll()
     if (ex) {
         std::rethrow_exception(ex);
     }
+}
+
+void parallelForceDeep(EvalState & state, Value & v, PosIdx pos)
+{
+    state.forceValue(v, pos);
+
+    Executor::WorkItems work;
+
+    switch (v.type()) {
+
+    case nAttrs: {
+        NixStringContext context;
+        if (state.tryAttrsToString(pos, v, context, StringCoercionMode::Strict, false)) {
+            return;
+        }
+        if (v.attrs()->get(state.ctx.symbols.sym_outPath)) {
+            return;
+        }
+        for (auto & a : *v.attrs()) {
+            // allocRootValue makes a GC-rooted copy of the Value so
+            // the graph stays alive for the whole duration of the
+            // work item even if the top-level value goes out of
+            // scope (the executor is not waited on explicitly).
+            work.emplace_back(
+                [value = allocRootValue(a.value), pos = a.pos, &state]() {
+                    parallelForceDeep(state, *value, pos);
+                },
+                0
+            );
+        }
+        break;
+    }
+
+    case nList: {
+        for (auto & elem : v.listItems()) {
+            work.emplace_back(
+                [value = allocRootValue(elem), &state]() { parallelForceDeep(state, *value, noPos); }, 0
+            );
+        }
+        break;
+    }
+
+    case nThunk:
+    case nInt:
+    case nFloat:
+    case nBool:
+    case nString:
+    case nPath:
+    case nNull:
+    case nExternal:
+    case nFunction:
+        break;
+    }
+
+    // Track the futures so they are drained when the EvalState is
+    // destroyed; discarding them would let background work outlive the
+    // state it references.
+    state.getFutures().spawn(std::move(work));
+}
+
+Value prim_parallel(EvalState & state, Value ** args)
+{
+    state.forceList(*args[0], noPos, "while evaluating the first argument passed to builtins.parallel");
+
+    if (state.ctx.parallelEvalEnabled()) {
+        Executor::WorkItems work;
+        for (auto & elem : args[0]->listItems()) {
+            // Only spawn work for elements that aren't already forced;
+            // the executor then evaluates them in the background while
+            // we force the second argument below. Forcing `x` will block
+            // on any in-flight element via the thunk waiter machinery.
+            if (elem.isThunk() && !elem.thunk().resolved()) {
+                // GC-rooted copy so the work item keeps the element
+                // alive even if the caller drops the list before the
+                // background force runs.
+                work.emplace_back(
+                    [value = allocRootValue(elem), &state]() { state.forceValue(*value, noPos); }, 0
+                );
+            }
+        }
+        if (!work.empty()) {
+            state.getFutures().spawn(std::move(work));
+        }
+    }
+
+    state.forceValue(*args[1], noPos);
+    return *args[1];
 }
 
 } // namespace nix

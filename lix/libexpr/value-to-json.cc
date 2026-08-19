@@ -1,4 +1,6 @@
 #include "lix/libexpr/value-to-json.hh"
+#include "lix/libexpr/eval-inline.hh" // IWYU pragma: keep
+#include "lix/libexpr/parallel-eval.hh"
 #include "lix/libutil/json.hh"
 #include "lix/libutil/signals.hh"
 #include "lix/libstore/store-api.hh"
@@ -7,12 +9,19 @@
 
 
 namespace nix {
+
 JSON printValueAsJSON(EvalState & state, bool strict,
     Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore)
 {
     checkInterrupt();
 
-    if (strict) state.forceValue(v, pos);
+    if (strict) {
+        if (state.ctx.parallelEvalEnabled() && !Executor::amWorkerThread) {
+            parallelForceDeep(state, v, pos);
+        } else {
+            state.forceValue(v, pos);
+        }
+    }
 
     JSON out;
 

@@ -1,5 +1,6 @@
 #include "lix/libexpr/eval.hh"
 #include "lix/libexpr/eval-settings.hh"
+#include "lix/libexpr/parallel-eval.hh"
 #include "lix/libstore/path.hh"
 #include "lix/libutil/archive.hh"
 #include "lix/libutil/ansicolor.hh"
@@ -234,20 +235,15 @@ void initLibExpr()
     libexprInitialised = true;
 }
 
+[[gnu::tls_model("initial-exec")]]
+thread_local void * EvalMemory::gcCache[EvalMemory::CACHES] = {};
+
 EvalMemory::EvalMemory()
 {
     assert(libexprInitialised);
-#if HAVE_BOEHMGC
-    GC_add_roots(static_cast<void *>(gcCache), static_cast<void *>(gcCache + CACHES));
-#endif
 }
 
-EvalMemory::~EvalMemory()
-{
-#if HAVE_BOEHMGC
-    GC_remove_roots(static_cast<void *>(gcCache), static_cast<void *>(gcCache + CACHES));
-#endif
-}
+EvalMemory::~EvalMemory() {}
 
 EvalBuiltins::EvalBuiltins(
     EvalMemory & mem,
@@ -389,6 +385,29 @@ Evaluator::Evaluator(
     static_assert(sizeof(Env) <= 16, "environment must be <= 16 bytes");
 }
 
+[[gnu::tls_model("initial-exec")]]
+thread_local size_t EvalState::callDepth = 0;
+
+Evaluator::~Evaluator() = default;
+
+bool Evaluator::parallelEvalEnabled() const
+{
+    // Parallel evaluation is incompatible with call-count profiling
+    // (the counters are plain std::maps) and with function-call
+    // tracing, so disable it in those modes.
+    return !stats.countCalls && !evalSettings.traceFunctionCalls && !debug
+        && Executor::isEnabled(evalSettings);
+}
+
+Executor & Evaluator::getExecutor()
+{
+    std::lock_guard lock(executorMutex);
+    if (!executor) {
+        executor = std::make_unique<Executor>(evalSettings);
+    }
+    return *executor;
+}
+
 box_ptr<EvalState> Evaluator::begin(AsyncIoRoot & aio)
 {
     assert(!activeEval);
@@ -409,12 +428,27 @@ EvalState::EvalState(AsyncIoRoot & aio, Evaluator & ctx) : ctx(ctx), aio(aio)
 
 EvalState::~EvalState()
 {
+    // Drain any pending parallel work before tearing down, so background
+    // work items never observe a partially-destroyed EvalState (the
+    // executor lives in `ctx` and may be destroyed shortly after we are).
+    if (futures) {
+        futures->finishAll();
+    }
     ctx.activeEval = nullptr;
 }
 
+FutureVector & EvalState::getFutures()
+{
+    std::lock_guard lock(futuresMutex);
+    if (!futures) {
+        futures = std::make_unique<FutureVector>(ctx.getExecutor());
+    }
+    return *futures;
+}
 
 void EvalPaths::allowPath(const Path & path)
 {
+    std::lock_guard lock(mutex);
     if (!allowedPaths) {
         return;
     }
@@ -445,9 +479,17 @@ CheckedSourcePath EvalPaths::checkSourcePath(const SourcePath & path_)
 {
     if (!allowedPaths) return auto(path_).unsafeIntoChecked();
 
-    auto i = resolvedPaths.find(path_.canonical().abs());
-    if (i != resolvedPaths.end())
-        return i->second;
+    {
+        std::shared_lock lock(mutex);
+        auto i = resolvedPaths.find(path_.canonical().abs());
+        if (i != resolvedPaths.end()) {
+            return i->second;
+        }
+    }
+
+    // Walk + insert under an exclusive lock: the walk reads the
+    // allowed-paths tree, which allowPath() mutates.
+    std::unique_lock lock(mutex);
 
     /* First canonicalize the path without symlinks, so we make sure an
      * attacker can't append ../../... to a path that would be in allowedPaths
@@ -917,13 +959,19 @@ Value EvalState::evalFile(const SourcePath & path_)
 {
     auto path = ctx.paths.checkSourcePath(path_);
 
-    if (auto i = ctx.caches.fileEval.find(path); i != ctx.caches.fileEval.end()) {
-        return i->second->result;
+    {
+        std::lock_guard lock(ctx.caches.mutex);
+        if (auto i = ctx.caches.fileEval.find(path); i != ctx.caches.fileEval.end()) {
+            return i->second->result;
+        }
     }
 
     auto resolvedPath = ctx.paths.resolveExprPath(path);
-    if (auto i = ctx.caches.fileEval.find(resolvedPath); i != ctx.caches.fileEval.end()) {
-        return i->second->result;
+    {
+        std::lock_guard lock(ctx.caches.mutex);
+        if (auto i = ctx.caches.fileEval.find(resolvedPath); i != ctx.caches.fileEval.end()) {
+            return i->second->result;
+        }
     }
 
     debug("evaluating file '%1%'", resolvedPath);
@@ -942,9 +990,12 @@ Value EvalState::evalFile(const SourcePath & path_)
         Value v = eval(e);
 
         auto cache = std::allocate_shared<CachedEvalFile>(TraceableAllocator<CachedEvalFile>(), v);
-        ctx.caches.fileEval[resolvedPath] = cache;
-        if (path != resolvedPath) {
-            ctx.caches.fileEval[path] = cache;
+        {
+            std::lock_guard lock(ctx.caches.mutex);
+            ctx.caches.fileEval[resolvedPath] = cache;
+            if (path != resolvedPath) {
+                ctx.caches.fileEval[path] = cache;
+            }
         }
 
         return v;
@@ -957,6 +1008,7 @@ Value EvalState::evalFile(const SourcePath & path_)
 
 void EvalState::resetFileCache()
 {
+    std::lock_guard lock(ctx.caches.mutex);
     ctx.caches.fileEval.clear();
 }
 
@@ -1750,11 +1802,16 @@ try {
     if (nix::isDerivation(path.canonical().abs()))
         co_return errors.make<EvalError>("file names are not allowed to end in '%1%'", drvExtension);
 
-    auto i = srcToStore.find(path);
+    std::optional<StorePath> cached;
+    {
+        std::lock_guard lock(mutex);
+        if (auto i = srcToStore.find(path); i != srcToStore.end()) {
+            cached = i->second;
+        }
+    }
 
-    auto dstPath = i != srcToStore.end()
-        ? i->second
-        : ({
+    auto dstPath =
+        cached ? *cached : ({
             auto dstPath = TRY_AWAIT(fetchToStoreRecursive(
                 *store,
                 *prepareDump(checkSourcePath(path).canonical().abs()),
@@ -1762,7 +1819,10 @@ try {
                 repair
             ));
             allowPath(dstPath);
-            srcToStore.insert_or_assign(path, dstPath);
+            {
+                std::lock_guard lock(mutex);
+                srcToStore.insert_or_assign(path, dstPath);
+            }
             printMsg(lvlChatty, "copied source '%1%' -> '%2%'", path, store->printStorePath(dstPath));
             std::move(dstPath);
         });
@@ -1984,7 +2044,7 @@ void Evaluator::printStatistics()
     struct rusage buf;
     getrusage(RUSAGE_SELF, &buf);
     float cpuTime = buf.ru_utime.tv_sec + ((float) buf.ru_utime.tv_usec / 1000000);
-    auto mem = this->mem.getStats();
+    const auto & mem = this->mem.getStats();
 
     uint64_t bEnvs = mem.nrEnvs * sizeof(Env) + mem.nrValuesInEnvs * sizeof(Value *);
     uint64_t bLists = mem.nrListElems * sizeof(Value *);
@@ -2002,14 +2062,14 @@ void Evaluator::printStatistics()
     JSON topObj = JSON::object();
     topObj["cpuTime"] = cpuTime;
     topObj["envs"] = {
-        {"number", mem.nrEnvs},
-        {"elements", mem.nrValuesInEnvs},
+        {"number", mem.nrEnvs.load()},
+        {"elements", mem.nrValuesInEnvs.load()},
         {"bytes", bEnvs},
     };
     topObj["list"] = {
-        {"elements", mem.nrListElems},
+        {"elements", mem.nrListElems.load()},
         {"bytes", bLists},
-        {"concats", stats.nrListConcats},
+        {"concats", stats.nrListConcats.load()},
     };
     // reported for compatibility, even though we no longer allocate these on the heap
     topObj["values"] = {
@@ -2021,9 +2081,9 @@ void Evaluator::printStatistics()
         {"bytes", symbols.totalSize()},
     };
     topObj["sets"] = {
-        {"number", mem.nrAttrsets},
+        {"number", mem.nrAttrsets.load()},
         {"bytes", bAttrsets},
-        {"elements", mem.nrAttrsInAttrsets},
+        {"elements", mem.nrAttrsInAttrsets.load()},
     };
     topObj["sizes"] = {
         {"Env", sizeof(Env)},
@@ -2031,13 +2091,13 @@ void Evaluator::printStatistics()
         {"Bindings", sizeof(Bindings)},
         {"Attr", sizeof(Attr)},
     };
-    topObj["nrOpUpdates"] = stats.nrOpUpdates;
-    topObj["nrOpUpdateValuesCopied"] = stats.nrOpUpdateValuesCopied;
-    topObj["nrThunks"] = stats.nrThunks;
-    topObj["nrAvoided"] = stats.nrAvoided;
-    topObj["nrLookups"] = stats.nrLookups;
-    topObj["nrPrimOpCalls"] = stats.nrPrimOpCalls;
-    topObj["nrFunctionCalls"] = stats.nrFunctionCalls;
+    topObj["nrOpUpdates"] = stats.nrOpUpdates.load();
+    topObj["nrOpUpdateValuesCopied"] = stats.nrOpUpdateValuesCopied.load();
+    topObj["nrThunks"] = stats.nrThunks.load();
+    topObj["nrAvoided"] = stats.nrAvoided.load();
+    topObj["nrLookups"] = stats.nrLookups.load();
+    topObj["nrPrimOpCalls"] = stats.nrPrimOpCalls.load();
+    topObj["nrFunctionCalls"] = stats.nrFunctionCalls.load();
 #if HAVE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},
@@ -2229,8 +2289,13 @@ kj::Promise<Result<std::optional<std::string>>>
 EvalPaths::resolveSearchPathPath(const SearchPath::Path & value0)
 try {
     auto & value = value0.s;
-    auto i = searchPathResolved.find(value);
-    if (i != searchPathResolved.end()) co_return i->second;
+    {
+        std::lock_guard lock(mutex);
+        auto i = searchPathResolved.find(value);
+        if (i != searchPathResolved.end()) {
+            co_return i->second;
+        }
+    }
 
     std::optional<std::string> res;
 
@@ -2272,7 +2337,10 @@ try {
     else
         debug("failed to resolve search path element '%s'", value);
 
-    searchPathResolved[value] = res;
+    {
+        std::lock_guard lock(mutex);
+        searchPathResolved[value] = res;
+    }
     co_return res;
 } catch (...) {
     co_return result::current_exception();

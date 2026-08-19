@@ -1,7 +1,7 @@
 # Parallel Evaluation for the Lix homelab fork — design doc
 
 Date: 2026-08-18
-Status: Stage 1 ✅ committed (c3306449f), Stage 2 ✅ committed (see below)
+Status: Stage 1 ✅ committed (c3306449f), Stage 2 ✅ committed (f587b55bf), Stage 3 ✅ (see below)
 Base: `homelab/2.96` rebased onto upstream `main` (`3470ce4d5`), 15 homelab commits reapplied.
 
 ## 1. Goal
@@ -149,14 +149,31 @@ Measured: no single-threaded regression. A/B of the zephyr toplevel eval (Stage 
 vs Stage 2 binary, same build config, alternating under load): median 25.6 s vs 25.5 s —
 the atomic machinery is effectively free on this workload.
 
-### Stage 3 — Parallel primitives + wiring
+### Stage 3 — Parallel primitives + wiring (DONE)
 
-- `builtins.parallel` primop: map a function over a list, one future per element via the
-  Executor, collect in order (result deterministic — evaluation is pure).
-- `parallelForceDeep` for `forceValueDeep` call sites: flake check attr evaluation, flake
-  show/search, `nix eval --json` value printing.
-- `nix flake check`: evaluate each check attrset in parallel.
-- Keep `eval-cores=1` as the escape hatch; default `0` (auto).
+Implemented and smoke-tested on the homelab fork:
+
+- `builtins.parallel` primop (in `parallel-eval.cc`), gated behind a new `parallel-eval`
+  experimental feature (`lix/libutil/experimental-features/parallel-eval.md` +
+  `lix/libexpr/builtins/parallel.md`). Forces the list elements in the background via the
+  Executor, then forces the second argument (which blocks on any in-flight elements).
+- `parallelForceDeep` (shared, in `parallel-eval.cc`): forces the top value synchronously,
+  spawns one work item per attr value / list element. Wired into `printValueAsJSON`
+  (`nix eval --json`) and `nix flake check`.
+- `nix flake check`: pre-forces every check derivation thunk in parallel (one work item
+  per thunk) before the sequential `checkDerivation` loop, which blocks on the waiters.
+  Store interactions stay on the main thread.
+- **Thread-safety pulled forward from Stage 4** (required before any real parallel eval):
+  `ChunkedVector` made append-safe for lock-free reads, `SymbolTable` intern guarded by a
+  mutex, `EvalMemory` per-thread caches + atomic stats, `EvalRuntimeCaches`/`EvalPaths`
+  guarded, `callDepth` made `thread_local`, `EvalStatistics` atomics.
+- **Executor lifetime fix**: spawned futures were previously discarded, letting background
+  work outlive the `EvalState` it referenced (crashed in the unit tests with a dangling
+  `Evaluator`). Now `EvalState` owns a `FutureVector` (created lazily via
+  `EvalState::getFutures()`), and `~EvalState()` drains it (`finishAll`) before teardown,
+  so workers never observe a partially-destroyed state.
+
+Keep `eval-cores=1` as the escape hatch; default `0` (auto).
 
 ### Stage 4 — Thread-safe EvalState internals
 

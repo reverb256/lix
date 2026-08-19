@@ -83,7 +83,123 @@ protected:
         );
         return v;
     }
+
+    /**
+     * Sets the global eval-cores setting for the duration of the scope,
+     * restoring it afterwards. parallelForceDeep reads this setting
+     * lazily (when the executor is first created), so it must be set
+     * before the call, not before the fixture is constructed.
+     */
+    struct ScopedEvalCores
+    {
+        unsigned long old;
+
+        explicit ScopedEvalCores(unsigned long cores) : old(evalSettings.evalCores.get())
+        {
+            evalSettings.set("eval-cores", std::to_string(cores));
+        }
+
+        ~ScopedEvalCores()
+        {
+            evalSettings.set("eval-cores", std::to_string(old));
+        }
+    };
 };
+
+TEST_F(ParallelEvalTest, parallelForceDeepForcesDeepStructure)
+{
+    ScopedEvalCores guard(4);
+
+    auto v = eval(
+        "{ a = { b = { c = 1 + 2; }; d = [ 4 5 (6 + 7) ]; }; "
+        "e = { f = \"hello\"; }; g = map (x: x * 2) [ 1 2 3 ]; }",
+        false
+    );
+
+    parallelForceDeep(state, v, noPos);
+
+    // v itself is forced to an attrset by parallelForceDeep.
+    ASSERT_TRUE(v.type() == nAttrs);
+
+    // Force every leaf (blocking on any in-flight workers) and check the
+    // values are correct.
+    const Attr * aAttr = v.attrs()->get(createSymbol("a"));
+    ASSERT_NE(aAttr, nullptr);
+    state.forceValue(aAttr->value, noPos); // blocks on the in-flight worker
+    ASSERT_TRUE(aAttr->value.type() == nAttrs);
+    const Attr * bAttr = aAttr->value.attrs()->get(createSymbol("b"));
+    ASSERT_NE(bAttr, nullptr);
+    state.forceValue(bAttr->value, noPos);
+    ASSERT_TRUE(bAttr->value.type() == nAttrs);
+    state.forceValue(bAttr->value.attrs()->get(createSymbol("c"))->value, noPos);
+    ASSERT_EQ(bAttr->value.attrs()->get(createSymbol("c"))->value.integer().value, 3);
+
+    const Attr * dAttr = aAttr->value.attrs()->get(createSymbol("d"));
+    ASSERT_NE(dAttr, nullptr);
+    state.forceValue(dAttr->value, noPos);
+    ASSERT_TRUE(dAttr->value.type() == nList);
+    state.forceValue(dAttr->value.listElems()[2], noPos);
+    ASSERT_EQ(dAttr->value.listElems()[2].integer().value, 13);
+
+    const Attr * gAttr = v.attrs()->get(createSymbol("g"));
+    ASSERT_NE(gAttr, nullptr);
+    state.forceValue(gAttr->value, noPos);
+    ASSERT_TRUE(gAttr->value.type() == nList);
+    state.forceValue(gAttr->value.listElems()[1], noPos);
+    ASSERT_EQ(gAttr->value.listElems()[1].integer().value, 4);
+}
+
+TEST_F(ParallelEvalTest, parallelForceDeepEvaluatesEachThunkOnce)
+{
+    ScopedEvalCores guard(4);
+    ScopedTraceCounter counter;
+
+    auto v = eval(
+        "let go = n: if n == 0 then builtins.trace \"EVALED\" 42 else go (n - 1); "
+        "in { a = go 9500; b = go 9500; c = go 9500; }",
+        false
+    );
+
+    parallelForceDeep(state, v, noPos);
+
+    // Force each attr (blocking on workers) and verify each was
+    // evaluated exactly once, even under parallel forcing.
+    for (auto * name : {"a", "b", "c"}) {
+        state.forceValue(v.attrs()->get(createSymbol(name))->value, noPos);
+        ASSERT_EQ(v.attrs()->get(createSymbol(name))->value.integer().value, 42);
+    }
+    ASSERT_EQ(counter.count.load(), 3);
+}
+
+TEST_F(ParallelEvalTest, builtinsParallelForcesListElementsInBackground)
+{
+    // The primop is gated behind the parallel-eval experimental feature
+    // and registered at EvalState construction time, so enable it and
+    // build a fresh evaluator for this test.
+    experimentalFeatureSettings.set("experimental-features", "nix-command parallel-eval");
+    evalSettings.set("eval-cores", "4");
+    ScopedTraceCounter counter;
+
+    Evaluator ev(aio, {}, store);
+    auto st = ev.begin(aio);
+    EvalState & s = *st;
+
+    // `x` depends on the list, so forcing it waits for (and joins with)
+    // the background forces spawned by builtins.parallel. Each element
+    // must still be evaluated exactly once.
+    auto v = s.eval(ev.parseExprFromString(
+        "let xs = [ (builtins.trace \"EVALED\" 1) (builtins.trace \"EVALED\" 2) ]; "
+        "in builtins.parallel xs (builtins.foldl' (a: b: a + b) 0 xs)",
+        CanonPath::root
+    ));
+    s.forceValue(v, noPos);
+    ASSERT_TRUE(v.type() == nInt);
+    ASSERT_EQ(v.integer().value, 3);
+    ASSERT_EQ(counter.count.load(), 2);
+
+    experimentalFeatureSettings.set("experimental-features", "");
+    evalSettings.set("eval-cores", "0");
+}
 
 TEST_F(ExecutorTest, spawnRunsAllWorkItems)
 {

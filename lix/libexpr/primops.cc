@@ -213,11 +213,14 @@ static Value import(EvalState & state, Value & vPath, Value * vScope)
         Value w{NewValueAs::attrs, attrs.finish()};
 
         if (!state.ctx.caches.vImportedDrvToDerivation) {
-            state.ctx.caches.vImportedDrvToDerivation =
-                allocRootValue(state.eval(state.ctx.parseExprFromString(
+            std::lock_guard lock(state.ctx.caches.mutex);
+            if (!state.ctx.caches.vImportedDrvToDerivation) {
+                state.ctx.caches.vImportedDrvToDerivation =
+                    allocRootValue(state.eval(state.ctx.parseExprFromString(
 #include "imported-drv-to-derivation.nix.gen.hh"
-                    , CanonPath::root
-                )));
+                        , CanonPath::root
+                    )));
+            }
         }
 
         state.forceFunction(
@@ -2904,11 +2907,13 @@ static Value prim_hashString(EvalState & state, Value ** args)
 struct RegexCache
 {
     // TODO use C++20 transparent comparison when available
+    std::mutex mutex;
     std::unordered_map<std::string_view, std::regex> cache;
     std::list<std::string> keys;
 
     std::regex get(std::string_view re)
     {
+        std::lock_guard lock(mutex);
         auto it = cache.find(re);
         if (it != cache.end())
             return it->second;
@@ -2920,7 +2925,10 @@ struct RegexCache
 static RegexCache & regexCacheOf(EvalState & state)
 {
     if (!state.ctx.caches.regexes) {
-        state.ctx.caches.regexes = std::make_shared<RegexCache>();
+        std::lock_guard lock(state.ctx.caches.mutex);
+        if (!state.ctx.caches.regexes) {
+            state.ctx.caches.regexes = std::make_shared<RegexCache>();
+        }
     }
     return *state.ctx.caches.regexes;
 }

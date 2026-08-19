@@ -55,5 +55,12 @@ Value prim_importNative(EvalState & state, Value ** args);
  */
 Value prim_exec(EvalState & state, Value ** args);
 
+/**
+ * Start evaluation of the values `xs` in the background (via the
+ * parallel-evaluation executor) and return `x`. Defined in
+ * parallel-eval.cc.
+ */
+Value prim_parallel(EvalState & state, Value ** args);
+
 std::tuple<Value, Value> makePositionThunks(EvalState & state, const PosIdx pos);
 }

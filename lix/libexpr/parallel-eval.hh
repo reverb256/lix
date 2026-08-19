@@ -20,6 +20,7 @@
 #endif
 
 #include "lix/libexpr/eval-settings.hh"
+#include "lix/libexpr/pos-idx.hh"
 #include "lix/libutil/signals.hh"
 #include "lix/libutil/sync.hh"
 
@@ -41,6 +42,9 @@
 #endif
 
 namespace nix {
+
+class EvalState;
+struct Value;
 
 /**
  * Move-only callable, for executor work items.
@@ -138,6 +142,16 @@ struct Executor
 
     static unsigned int getEvalCores(const EvalSettings & evalSettings);
 
+    /**
+     * Whether parallel evaluation is enabled for the given settings
+     * (eval-cores > 1 after the 0 == auto default is resolved). Does
+     * not create the executor; see Evaluator::getExecutor().
+     */
+    static bool isEnabled(const EvalSettings & evalSettings)
+    {
+        return getEvalCores(evalSettings) > 1;
+    }
+
     Executor(const EvalSettings & evalSettings);
 
     ~Executor();
@@ -155,6 +169,17 @@ struct Executor
     [[gnu::tls_model("initial-exec")]]
     static thread_local bool amWorkerThread;
 };
+
+/**
+ * Force a value deeply, in parallel, using the evaluation executor.
+ * Spawns one work item per attribute value / list element so the
+ * executor evaluates them concurrently; the caller's subsequent
+ * sequential walk then reads already-forced values (blocking on any
+ * in-flight work via the thunk waiter machinery). Used by the JSON
+ * value printer (nix eval --json) and flake check. Ported from
+ * Determinate Nix.
+ */
+void parallelForceDeep(EvalState & state, Value & v, PosIdx pos);
 
 struct FutureVector
 {

@@ -1,10 +1,11 @@
 #pragma once
 ///@file
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <vector>
 #include <limits>
+#include <vector>
 
 namespace nix {
 
@@ -16,12 +17,27 @@ namespace nix {
  * on large data sets by on average (growth factor)/2, mostly
  * eliminates copies within the vector during resizing, and provides stable
  * references to its elements.
+ *
+ * Thread safety: appends (::add) are safe to run concurrently with
+ * reads of already-published elements (::operator[]), provided appends
+ * are themselves serialized by the caller. This is achieved by:
+ *   - storing the chunk-pointer array in a fixed-size std::array that
+ *     never reallocates, so a reader indexing into it is always safe;
+ *   - reserving each chunk to its full capacity when it is created, so
+ *     the chunk's data() pointer never moves;
+ *   - publishing an element (writing it into the chunk) before handing
+ *     out its index, so a reader can only ever observe fully-written
+ *     elements.
+ * The `size` counter is atomic so ::size() can be read from any thread.
  */
 template<typename T, size_t ChunkSize>
 class ChunkedVector {
 private:
-    uint32_t size_ = 0;
-    std::vector<std::vector<T>> chunks;
+    static constexpr size_t MaxChunks = 1 << 16;
+
+    std::atomic<uint32_t> size_{0};
+    std::atomic<uint32_t> numChunks{0};
+    std::vector<T> chunks[MaxChunks];
 
     /**
      * Keep this out of the ::add hot path
@@ -29,32 +45,37 @@ private:
     [[gnu::noinline]]
     auto & addChunk()
     {
-        if (size_ >= std::numeric_limits<uint32_t>::max() - ChunkSize)
+        if (size_.load(std::memory_order_relaxed) >= std::numeric_limits<uint32_t>::max() - ChunkSize) {
             abort();
-        chunks.emplace_back();
-        chunks.back().reserve(ChunkSize);
-        return chunks.back();
+        }
+        const auto n = numChunks.fetch_add(1, std::memory_order_relaxed);
+        if (n >= MaxChunks) {
+            abort();
+        }
+        chunks[n].reserve(ChunkSize);
+        return chunks[n];
     }
 
 public:
-    ChunkedVector(uint32_t reserve = 1)
+    ChunkedVector(uint32_t)
     {
-        chunks.reserve(reserve);
         addChunk();
     }
 
     uint32_t size() const noexcept
     {
-        return size_;
+        return size_.load(std::memory_order_relaxed);
     }
 
     template<typename... Args>
     std::pair<T &, uint32_t> add(Args &&... args)
     {
-        const auto idx = size_++;
-        auto & chunk = [&] () -> auto & {
-            if (auto & back = chunks.back(); back.size() < ChunkSize)
+        const auto idx = size_.fetch_add(1, std::memory_order_relaxed);
+        auto & chunk = [&]() -> auto & {
+            if (auto & back = chunks[numChunks.load(std::memory_order_relaxed) - 1]; back.size() < ChunkSize)
+            {
                 return back;
+            }
             return addChunk();
         }();
         auto & result = chunk.emplace_back(std::forward<Args>(args)...);
@@ -74,9 +95,11 @@ public:
     template<typename Fn>
     void forEach(Fn fn) const
     {
-        for (const auto & c : chunks)
-            for (const auto & e : c)
+        for (size_t n = 0; n < numChunks.load(std::memory_order_relaxed); n++) {
+            for (const auto & e : chunks[n]) {
                 fn(e);
+            }
+        }
     }
 };
 }

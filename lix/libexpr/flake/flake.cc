@@ -971,10 +971,13 @@ Value callFlake(EvalState & state, const LockedFlake & lockedFlake)
     Value vRootSubdir = {NewValueAs::string, lockedFlake.flake.lockedRef.subdir};
 
     if (!state.ctx.caches.vCallFlake) {
-        state.ctx.caches.vCallFlake = allocRootValue(state.eval(state.ctx.parseExprFromString(
+        std::lock_guard lock(state.ctx.caches.mutex);
+        if (!state.ctx.caches.vCallFlake) {
+            state.ctx.caches.vCallFlake = allocRootValue(state.eval(state.ctx.parseExprFromString(
 #include "call-flake.nix.gen.hh"
-            , CanonPath::root
-        )));
+                , CanonPath::root
+            )));
+        }
     }
 
     Value vTmp1 = state.callFunction(*state.ctx.caches.vCallFlake, vLocks, noPos);

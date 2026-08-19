@@ -18,11 +18,14 @@
 #include "lix/libexpr/repl-exit-status.hh"
 #include "lix/libutil/backed-string-view.hh"
 
+#include <atomic>
 #include <concepts>
-#include <map>
-#include <optional>
-#include <unordered_map>
 #include <functional>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <unordered_map>
 
 namespace nix {
 
@@ -172,18 +175,23 @@ class EvalMemory
     static constexpr size_t CACHE_INCREMENT = sizeof(void *);
 
     /**
-     * Allocation caches for small values.
+     * Allocation caches for small values. Per-thread: evaluator worker
+     * threads allocate concurrently, and Boehm GC is itself a global
+     * resource, so a shared cache would be a data race. thread_local
+     * storage is scanned by the collector (verified empirically), so no
+     * explicit GC root registration is needed.
      */
-    void * gcCache[CACHES] = {};
+    [[gnu::tls_model("initial-exec")]]
+    static thread_local void * gcCache[CACHES];
 
 public:
     struct Statistics
     {
-        unsigned long nrEnvs = 0;
-        unsigned long nrValuesInEnvs = 0;
-        unsigned long nrAttrsets = 0;
-        unsigned long nrAttrsInAttrsets = 0;
-        unsigned long nrListElems = 0;
+        std::atomic<unsigned long> nrEnvs = 0;
+        std::atomic<unsigned long> nrValuesInEnvs = 0;
+        std::atomic<unsigned long> nrAttrsets = 0;
+        std::atomic<unsigned long> nrAttrsInAttrsets = 0;
+        std::atomic<unsigned long> nrListElems = 0;
     };
 
     EvalMemory();
@@ -208,7 +216,10 @@ public:
         return BindingsBuilder(symbols, allocBindings(capacity), capacity);
     }
 
-    const Statistics getStats() const { return stats; }
+    const Statistics & getStats() const
+    {
+        return stats;
+    }
 
 private:
     Statistics stats;
@@ -281,6 +292,13 @@ struct CachedEvalFile;
 
 struct EvalRuntimeCaches
 {
+    /**
+     * Guards the caches below: they are written during evaluation
+     * (evalFile, prim_match, callFlake, ...), which can now happen on
+     * evaluator worker threads.
+     */
+    std::mutex mutex;
+
     RootValue vCallFlake;
     RootValue vImportedDrvToDerivation;
 
@@ -312,6 +330,15 @@ class EvalPaths
     ref<Store> store;
     SearchPath searchPath_;
     EvalErrorContext & errors;
+
+    /**
+     * Guards the caches below, which are written during evaluation
+     * (checkSourcePath, addToStore, resolveSearchPathElem) and so can be
+     * touched from evaluator worker threads. Shared for the resolvedPaths
+     * cache-hit path (concurrent reads); exclusive for path walks and
+     * writes.
+     */
+    std::shared_mutex mutex;
 
 public:
     EvalPaths(
@@ -454,14 +481,14 @@ public:
 
 struct EvalStatistics
 {
-    unsigned long nrLookups = 0;
-    unsigned long nrAvoided = 0;
-    unsigned long nrOpUpdates = 0;
-    unsigned long nrOpUpdateValuesCopied = 0;
-    unsigned long nrListConcats = 0;
-    unsigned long nrPrimOpCalls = 0;
-    unsigned long nrFunctionCalls = 0;
-    unsigned long nrThunks = 0;
+    std::atomic<unsigned long> nrLookups = 0;
+    std::atomic<unsigned long> nrAvoided = 0;
+    std::atomic<unsigned long> nrOpUpdates = 0;
+    std::atomic<unsigned long> nrOpUpdateValuesCopied = 0;
+    std::atomic<unsigned long> nrListConcats = 0;
+    std::atomic<unsigned long> nrPrimOpCalls = 0;
+    std::atomic<unsigned long> nrFunctionCalls = 0;
+    std::atomic<unsigned long> nrThunks = 0;
 
     bool countCalls = false;
 
@@ -472,12 +499,17 @@ struct EvalStatistics
     void addCall(ExprLambda & fun);
 };
 
+struct Executor; // parallel-eval.hh; defined out-of-line to avoid pulling GC_THREADS into every TU
+struct FutureVector; // parallel-eval.hh; same rationale
+
 class Evaluator
 {
     friend class EvalBuiltins;
     friend class EvalState;
 
     EvalState * activeEval = nullptr;
+
+    std::mutex executorMutex;
 
 public:
     NixSymbolTable symbols;
@@ -506,6 +538,27 @@ public:
 
     std::unique_ptr<DebugState> debug;
     EvalErrorContext errors;
+
+    /**
+     * Parallel-evaluation executor, created lazily on first use (most
+     * evaluations never touch it, so don't spawn worker threads
+     * eagerly). See parallel-eval.{hh,cc}.
+     */
+    std::unique_ptr<Executor> executor;
+
+    /**
+     * Whether parallel evaluation is enabled (eval-cores > 1) and
+     * usable in this evaluator.
+     */
+    bool parallelEvalEnabled() const;
+
+    /**
+     * The parallel evaluation executor, creating it on first use.
+     * Thread-safe: may be called from evaluator worker threads.
+     */
+    Executor & getExecutor();
+
+    ~Evaluator();
 
     Evaluator(
         AsyncIoRoot & aio,
@@ -635,6 +688,24 @@ class EvalState
 public:
     Evaluator & ctx;
     AsyncIoRoot & aio;
+
+private:
+    /**
+     * Tracks the futures of parallel work spawned during evaluation so
+     * they can be drained (blocked on) before this EvalState is torn
+     * down. Declared before the destructor so background work items
+     * never observe a partially-destroyed EvalState. Created lazily on
+     * first use, because most evaluations never spawn parallel work.
+     */
+    std::mutex futuresMutex;
+    std::unique_ptr<FutureVector> futures;
+
+public:
+    /**
+     * The parallel-work future tracker, creating it on first use.
+     * Thread-safe: may be called from evaluator worker threads.
+     */
+    FutureVector & getFutures();
 
     EvalState(const EvalState &) = delete;
     EvalState(EvalState &&) = delete;
@@ -775,7 +846,13 @@ private:
     /**
      * Current Nix call stack depth, used with `max-call-depth` setting to throw stack overflow hopefully before we run out of system stack.
      */
-    size_t callDepth = 0;
+    /**
+     * Per-thread eval call depth (max-call-depth stack overflow check).
+     * thread_local because evaluator worker threads recurse
+     * independently.
+     */
+    [[gnu::tls_model("initial-exec")]]
+    static thread_local size_t callDepth;
 
 public:
 

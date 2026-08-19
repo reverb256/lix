@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include <mutex>
 #include <unordered_map>
 
 #include "lix/libutil/types.hh"
@@ -126,6 +127,15 @@ private:
     std::unordered_map<std::string_view, uint32_t> symbols;
     ChunkedVector<InternedSymbol, 8192> store{16};
 
+    /**
+     * Guards ::create() so interning is safe from evaluator worker
+     * threads. ::operator[] is lock-free: symbol IDs are stable ints,
+     * the ChunkedVector storage never reallocates, and a reader can
+     * only observe symbols that were fully written before their ID was
+     * published.
+     */
+    std::mutex mutex;
+
 public:
 
     /**
@@ -137,7 +147,7 @@ public:
         // for lookup performance.
         // TODO: could probably be done more efficiently with transparent Hash and Equals
         // on the original implementation using unordered_set
-        // FIXME: make this thread-safe.
+        std::lock_guard lock(mutex);
         auto it = symbols.find(s);
         if (it != symbols.end()) {
             return Symbol(it->second + 1);

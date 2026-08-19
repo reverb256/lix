@@ -11,6 +11,7 @@
 #include "lix/libstore/derivations.hh"
 #include "lix/libstore/outputs-spec.hh"
 #include "lix/libexpr/attr-path.hh"
+#include "lix/libexpr/parallel-eval.hh"
 #include "lix/libfetchers/fetchers.hh"
 #include "lix/libfetchers/registry.hh"
 #include "lix/libexpr/eval-cache.hh"
@@ -624,26 +625,62 @@ struct CmdFlakeCheck : FlakeCommand
 
                         if (name == "checks") {
                             state->forceAttrs(vOutput, pos, "");
+                            std::vector<Value *> checksToCheck;
                             for (auto & attr : *vOutput.attrs()) {
                                 const auto & attr_name = evaluator->symbols[attr.name];
                                 checkSystemName(attr_name, attr.pos);
                                 if (checkSystemType(attr_name, attr.pos)) {
                                     state->forceAttrs(attr.value, attr.pos, "");
                                     for (auto & attr2 : *attr.value.attrs()) {
-                                        auto drvPath = checkDerivation(
-                                            fmt("%s.%s.%s",
-                                                name,
-                                                attr_name,
-                                                evaluator->symbols[attr2.name]),
-                                            attr2.value,
-                                            attr2.pos
+                                        checksToCheck.push_back(&attr2.value);
+                                    }
+                                }
+                            }
+                            // Evaluate all check derivations deeply, in
+                            // parallel, so the sequential checking loop
+                            // below only reads already-forced values
+                            // (all store interactions stay on this
+                            // thread).
+                            if (state->ctx.parallelEvalEnabled()) {
+                                // Force every check derivation in parallel
+                                // by spawning one work item per thunk; the
+                                // sequential checkDerivation loop below then
+                                // blocks on any in-flight forcing via the
+                                // thunk waiter machinery (all store
+                                // interactions stay on this thread).
+                                Executor::WorkItems work;
+                                for (auto * v : checksToCheck) {
+                                    if (v->isThunk() && !v->thunk().resolved()) {
+                                        work.emplace_back(
+                                            [value = allocRootValue(*v), state = state.get()]() {
+                                                state->forceValue(*value, noPos);
+                                            },
+                                            0
                                         );
-                                        if (drvPath && attr_name == evalSettings.getCurrentSystem()) {
-                                            drvPaths.push_back(DerivedPath::Built {
+                                    }
+                                }
+                                if (!work.empty()) {
+                                    state->getFutures().spawn(std::move(work));
+                                }
+                            }
+                            for (auto & attr : *vOutput.attrs()) {
+                                const auto & attr_name = evaluator->symbols[attr.name];
+                                if (!checkSystemType(attr_name, attr.pos)) {
+                                    continue;
+                                }
+                                for (auto & attr2 : *attr.value.attrs()) {
+                                    auto drvPath = checkDerivation(
+                                        fmt("%s.%s.%s", name, attr_name, evaluator->symbols[attr2.name]),
+                                        attr2.value,
+                                        attr2.pos
+                                    );
+                                    if (drvPath && attr_name == evalSettings.getCurrentSystem()) {
+                                        drvPaths.push_back(
+                                            DerivedPath::Built{
                                                 .drvPath = makeConstantStorePath(*drvPath),
-                                                .outputs = OutputsSpec::All { },
-                                            });
-                                        }
+                                                .outputs = OutputsSpec::All{},
+                                            }
+                                        );
                                     }
                                 }
                             }
