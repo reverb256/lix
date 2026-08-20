@@ -1,6 +1,16 @@
 /build
 /outputs
 
+# local benchmark binaries + session state (never commit)
+bench-base/
+bench-dev/
+bench/results/
+default.profraw
+
+# agent session scaffolding
+.agents/
+.freebuff/
+
 # GNU Global
 GPATH
 GRTAGS
