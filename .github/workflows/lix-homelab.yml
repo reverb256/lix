@@ -50,7 +50,11 @@ jobs:
       - name: Build Lix (with tests)
         id: build
         run: |
-          set -o pipefail
+          # GitHub Actions' default shell is `bash -e -o pipefail`; the -e is
+          # inherited from the runner wrapper, so disable errexit explicitly or
+          # the failing pipeline below aborts the step before the tolerance
+          # logic can run.
+          set +e
           # Build on this runner only: nexus's daemon would otherwise
           # dispatch to its remote builders (zephyr/sentry via
           # /etc/nix/machines), which defeats the point of the
