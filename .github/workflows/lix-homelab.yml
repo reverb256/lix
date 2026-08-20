@@ -9,15 +9,15 @@ name: lix-homelab
 # package.nix: doCheck = canRunInstalled), so a green run means the
 # patched tree builds AND its functional/cargo tests pass.
 #
-# Runs on a self-hosted runner. Preferred: the SENTRY lix runner
-# (reverb256/nixos-config ci-runners generator, `lix` instance), which is
-# configured with disableNoNewPrivileges=true — the functional2 suite needs
-# that: it spawns its own daemon doing REAL sandboxing (unshare mount
-# namespaces), and NoNewPrivileges=true blocks it even when
-# kernel.unprivileged_userns_clone=1 (hosts/sentry/services.nix). The nexus
-# runner is the fallback while sentry's runner is still being deployed; on
-# nexus (NoNewPrivileges=true) functional-shell cannot run, so the build
-# step tolerates exactly that signature and the bench/cachix steps skip.
+# Runs on the self-hosted nexus lix runner (reverb256/lix's only registered
+# runner today). NOTE: nexus's deployed runner has NoNewPrivileges=true, so
+# functional-shell (which needs unshare mount namespaces) cannot run there.
+# hosts/sentry/services.nix defines a sentry lix runner with
+# disableNoNewPrivileges=true — once that is deployed and registered, switch
+# this job's runs-on to [self-hosted, nixos, sentry, builder] and the full
+# sandbox suite will pass for real. Until then, the build step tolerates
+# exactly the functional-shell EPERM signature and bench/cachix skip (no
+# store path is produced when the build is tolerated).
 
 on:
   push:
@@ -30,11 +30,7 @@ permissions:
 jobs:
   build:
     name: build + test + push to cachix
-    # Either label set matches; the first online runner with matching labels
-    # takes the job.
-    runs-on:
-      - [self-hosted, nixos, nexus, builder]
-      - [self-hosted, nixos, sentry, builder]
+    runs-on: [self-hosted, nixos, nexus, builder]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
