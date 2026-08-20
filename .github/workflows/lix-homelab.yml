@@ -32,7 +32,9 @@ jobs:
     name: build + test + push to cachix
     # Either label set matches; the first online runner with matching labels
     # takes the job.
-    runs-on: [[self-hosted, nixos, nexus, builder], [self-hosted, nixos, sentry, builder]]
+    runs-on:
+      - [self-hosted, nixos, nexus, builder]
+      - [self-hosted, nixos, sentry, builder]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
