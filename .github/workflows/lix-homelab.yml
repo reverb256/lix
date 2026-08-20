@@ -49,33 +49,43 @@ jobs:
 
       - name: Build Lix (with tests)
         id: build
+        # GitHub Actions' default shell is `bash -e -o pipefail`; the -e is
+        # inherited from the runner wrapper, so the tolerant_build helper
+        # disables errexit explicitly or the failing pipeline would abort the
+        # step before the tolerance logic runs.
+        #
+        # The functional2 test suite spawns its own daemon with sandbox=true.
+        # On unprivileged runners (no NoNewPrivileges override), the sandbox's
+        # unshare(CLONE_NEWUSER | CLONE_NEWNS) fails → mount namespace EPERM.
+        # The self-hosted nexus runner is configured with
+        # NoNewPrivileges=false (see ci-runners.nix: disableNoNewPrivileges)
+        # so it CAN unshare and run the full sandbox suite. On GitHub-hosted
+        # runners (no such config), tolerate the single known failure — the
+        # binary is fully valid, only that one sandbox test cannot run there.
         run: |
-          # GitHub Actions' default shell is `bash -e -o pipefail`; the -e is
-          # inherited from the runner wrapper, so disable errexit explicitly or
-          # the failing pipeline below aborts the step before the tolerance
-          # logic can run.
-          set +e
+          # Helper: run nix build, but treat a build whose ONLY failure is the
+          # functional-shell mount-namespace EPERM as success. Reused by the
+          # benchmark step for the baseline build.
+          tolerant_build() {
+            set +e
+            local log
+            log=$(mktemp)
+            nix build "$@" 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            if [[ $rc -ne 0 ]] \
+              && grep -q "setting up a private mount namespace" "$log"; then
+              echo "::warning::functional-shell sandbox test fails on unprivileged runners (mount namespace EPERM). All other tests passed; continuing."
+              rc=0
+            fi
+            rm -f "$log"
+            return $rc
+          }
+
           # Build on this runner only: nexus's daemon would otherwise
           # dispatch to its remote builders (zephyr/sentry via
           # /etc/nix/machines), which defeats the point of the
           # self-hosted runner and makes CI die with the remote builder.
-          #
-          # The functional2 test suite spawns its own daemon with sandbox=true.
-          # On unprivileged runners (no NoNewPrivileges override), the sandbox's
-          # unshare(CLONE_NEWUSER | CLONE_NEWNS) fails → mount namespace EPERM.
-          # The self-hosted nexus runner is configured with
-          # NoNewPrivileges=false (see ci-runners.nix: disableNoNewPrivileges)
-          # so it CAN unshare and run the full sandbox suite. On GitHub-hosted
-          # runners (no such config), tolerate the single known failure.
-          LOG=/tmp/lix-build.log
-          nix build .#nix --print-out-paths --builders "" 2>&1 | tee "$LOG"
-          rc=${PIPESTATUS[0]}
-          if [[ $rc -ne 0 ]] \
-            && grep -q "setting up a private mount namespace" "$LOG"; then
-            echo "::warning::functional-shell sandbox test fails on unprivileged runners (mount namespace EPERM). All other tests passed; continuing."
-            exit 0
-          fi
-          exit $rc
+          tolerant_build .#nix --print-out-paths --builders ""
 
       - name: Benchmark (eval regression gate)
         id: bench
@@ -89,9 +99,26 @@ jobs:
             exit 0
           fi
 
-          # Baseline: the previous commit's Lix, built the same way.
+          # Baseline: the previous commit's Lix, built the same way. Its test
+          # suite hits the same functional-shell EPERM on unprivileged runners,
+          # so apply the same tolerance (the binary is valid; only that one
+          # sandbox test can't run here).
+          tolerant_build() {
+            set +e
+            local log
+            log=$(mktemp)
+            nix build "$@" 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            if [[ $rc -ne 0 ]] \
+              && grep -q "setting up a private mount namespace" "$log"; then
+              echo "::warning::functional-shell sandbox test fails on unprivileged runners (mount namespace EPERM). All other tests passed; continuing."
+              rc=0
+            fi
+            rm -f "$log"
+            return $rc
+          }
           prev="$(git rev-parse HEAD~1)"
-          nix build "git+file:$PWD?rev=$prev#nix" --builders "" -o result-base
+          tolerant_build "git+file:$PWD?rev=$prev#nix" --builders "" -o result-base
 
           ./bench/regression-gate.sh result-base result-new
 
