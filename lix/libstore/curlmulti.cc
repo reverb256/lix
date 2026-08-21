@@ -59,6 +59,18 @@ CurlMulti::CurlMulti(unsigned int baseRetryTimeMs)
     std::call_once(globalInit, curl_global_init, CURL_GLOBAL_ALL);
 
     curl_multi_setopt(curlm.get(), CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    // Limit HTTP/2 multiplexing to ONE stream per connection (2026-08-21).
+    // Lix's transfer code pauses transfers when its buffer exceeds 1 MiB
+    // (CURL_WRITEFUNC_PAUSE in transferitem.cc). With multiple multiplexed
+    // streams on one HTTP/2 connection, curl fails to send window-size
+    // updates for a paused slow stream (curl #16955 — the Lix HTTP library
+    // reproducer), deadlocking the transfer: TCP connects and data flows,
+    // but the transfer never completes -> "0 bytes received" timeout on
+    // every substituter. Capping MAX_CONCURRENT_STREAMS at 1 keeps HTTP/2
+    // but never multiplexes, so the pause deadlock class cannot occur.
+    // (The nixpkgs fix for this was "lix: remove broken perf patch from
+    // curl" #534757; this is the fork-side hardening that is version-proof.)
+    curl_multi_setopt(curlm.get(), CURLMOPT_MAX_CONCURRENT_STREAMS, 1);
     curl_multi_setopt(curlm.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS,
         fileTransferSettings.httpConnections.get());
 
